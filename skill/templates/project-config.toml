@@ -1,0 +1,32 @@
+config_version = 1
+harness_version = "0.1.0"
+project_name = "example"
+project_type = "generic"
+context_files = []
+ci_files = []
+detected_files = []
+workspace_members = []
+build_entrypoints = []
+protected_paths = [".git/", ".env", ".env.*", ".harness/config.toml", ".harness/state.json", ".harness/runtime/"]
+max_slice_attempts = 3
+error_excerpt_limit = 1200
+
+[commands]
+formatter = []
+lint = []
+check = []
+unit_test = []
+integration_test = []
+
+[codex]
+command = ["codex"]
+implementer_sandbox = "workspace-write"
+reviewer_sandbox = "read-only"
+ephemeral = true
+
+[context_maintenance]
+enabled = true
+idle_compaction_threshold = 0.45
+max_compactions_per_worker_run = 1
+min_tokens_since_last_compaction = 20000
+rehydrate_after_compaction = true

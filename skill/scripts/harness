@@ -1,0 +1,1665 @@
+#!/usr/bin/env python3
+"""Hermes + Codex project harness. Standard-library only."""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import ctypes
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from typing import Any, Iterable
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    tomllib = None
+
+HARNESS_VERSION = "0.1.0"
+CONFIG_VERSION = 1
+STATES = {
+    "STAGE_DISCUSSION", "STAGE_APPROVED", "SLICE_READY", "IMPLEMENTING",
+    "VALIDATING", "REVIEWING", "CHANGES_REQUIRED", "APPROVED", "BLOCKED",
+    "HUMAN_CHECKPOINT", "STAGE_COMPLETED",
+}
+TRANSITIONS = {
+    "STAGE_DISCUSSION": {"STAGE_APPROVED"},
+    "STAGE_APPROVED": {"SLICE_READY", "BLOCKED"},
+    "SLICE_READY": {"IMPLEMENTING", "BLOCKED", "HUMAN_CHECKPOINT"},
+    "IMPLEMENTING": {"VALIDATING", "BLOCKED", "HUMAN_CHECKPOINT"},
+    "VALIDATING": {"REVIEWING", "CHANGES_REQUIRED", "BLOCKED", "HUMAN_CHECKPOINT"},
+    "REVIEWING": {"CHANGES_REQUIRED", "APPROVED", "BLOCKED", "HUMAN_CHECKPOINT"},
+    "CHANGES_REQUIRED": {"IMPLEMENTING", "HUMAN_CHECKPOINT", "BLOCKED"},
+    "APPROVED": {"SLICE_READY", "STAGE_COMPLETED"},
+    "BLOCKED": {"SLICE_READY", "CHANGES_REQUIRED", "HUMAN_CHECKPOINT"},
+    "HUMAN_CHECKPOINT": {"SLICE_READY", "CHANGES_REQUIRED", "BLOCKED"},
+    "STAGE_COMPLETED": {"STAGE_APPROVED"},
+}
+REPORT_FILES = {
+    "implementer": "implementation.json",
+    "reviewer": "review.json",
+    "gates": "quality-gates.json",
+}
+SECRET_NAMES = re.compile(r"(?i)(api[_-]?key|token|password|secret|credential|authorization|cookie|database_url)")
+SECRET_VALUE = re.compile(
+    r"(?i)(bearer\s+\S+|(?:[A-Z0-9_]*(?:api[_-]?key|token|password|secret|credential|authorization|cookie)|database_url)\s*[:=]\s*\S+|[a-z][a-z0-9+.-]*://[^\s:/]+:[^\s@]+@\S+|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN(?: [A-Z]+)* PRIVATE KEY-----)"
+)
+
+
+class HarnessError(RuntimeError):
+    pass
+
+
+def enable_child_subreaper() -> None:
+    """Make orphaned worker descendants reparent to this dedicated CLI process."""
+    if not sys.platform.startswith("linux"):
+        raise HarnessError("secure worker lifecycle requires Linux PR_SET_CHILD_SUBREAPER")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise HarnessError(f"cannot enable child subreaper: errno={ctypes.get_errno()}")
+
+
+def direct_child_pids(parent_pid: int) -> set[int]:
+    children: set[int] = set()
+    proc_root = pathlib.Path("/proc")
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "stat").read_text(encoding="utf-8")
+            fields = raw[raw.rfind(")") + 2:].split()
+            if len(fields) > 1 and int(fields[1]) == parent_pid:
+                children.add(int(entry.name))
+        except (FileNotFoundError, PermissionError, ValueError):
+            continue
+    return children
+
+
+def current_cgroup_dir() -> pathlib.Path:
+    raw = pathlib.Path("/proc/self/cgroup").read_text(encoding="utf-8").strip()
+    relative = raw.split(":")[-1].lstrip("/")
+    path = pathlib.Path("/sys/fs/cgroup") / relative
+    if not (path / "cgroup.controllers").exists() and not (path / "cgroup.procs").exists():
+        raise HarnessError("cgroup v2 is unavailable")
+    return path
+
+
+def validate_worker_cgroup(path: pathlib.Path) -> pathlib.Path:
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(pathlib.Path("/sys/fs/cgroup")):
+        raise HarnessError("worker cgroup is outside cgroup v2")
+    if not resolved.name.startswith("hermes-codex-harness-"):
+        raise HarnessError("invalid worker cgroup identity")
+    if not (resolved / "cgroup.procs").is_file() or not (resolved / "cgroup.kill").is_file():
+        raise HarnessError("worker cgroup lacks required controls")
+    return resolved
+
+
+def create_worker_cgroup() -> pathlib.Path:
+    parent = current_cgroup_dir()
+    path = parent / f"hermes-codex-harness-{os.getpid()}-{time.time_ns()}"
+    try:
+        path.mkdir(mode=0o700)
+    except OSError as exc:
+        raise HarnessError(f"cannot create worker cgroup: {type(exc).__name__}") from exc
+    return validate_worker_cgroup(path)
+
+
+def destroy_worker_cgroup(path: pathlib.Path, kill: bool = True) -> None:
+    if not path.exists():
+        if (not path.is_absolute() or path.parent == path or
+                not path.name.startswith("hermes-codex-harness-") or
+                not str(path).startswith("/sys/fs/cgroup/")):
+            raise HarnessError("invalid missing worker cgroup identity")
+        return
+    cgroup = validate_worker_cgroup(path)
+    if kill:
+        try:
+            (cgroup / "cgroup.kill").write_text("1", encoding="ascii")
+        except OSError as exc:
+            raise HarnessError(f"cannot kill worker cgroup: {type(exc).__name__}") from exc
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        events = (cgroup / "cgroup.events").read_text(encoding="ascii")
+        if "populated 0" in events:
+            break
+        time.sleep(0.02)
+    else:
+        raise HarnessError("worker cgroup did not become empty")
+    try:
+        cgroup.rmdir()
+    except OSError as exc:
+        raise HarnessError(f"cannot remove worker cgroup: {type(exc).__name__}") from exc
+
+
+def terminate_worker_tree(proc: subprocess.Popen[str], parent_waited: bool = False,
+                          cgroup: pathlib.Path | None = None) -> int:
+    """Terminate the worker process group and all subreaper-adopted descendants."""
+    if not parent_waited and proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+    if proc.poll() is None:
+        proc.wait()
+    rc = int(proc.returncode if proc.returncode is not None else 1)
+    if cgroup is not None:
+        destroy_worker_cgroup(cgroup, kill=True)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, sig)
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            adopted = direct_child_pids(os.getpid())
+            if not adopted:
+                break
+            for pid in adopted:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, sig)
+            time.sleep(0.02)
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        adopted = direct_child_pids(os.getpid())
+        for pid in adopted:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        while True:
+            try:
+                waited, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return rc
+            if waited == 0:
+                break
+        time.sleep(0.02)
+    raise HarnessError("adopted worker descendants did not drain")
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def concise(text: str, limit: int) -> str:
+    clean = SECRET_VALUE.sub("[REDACTED]", text or "")
+    clean = " ".join(clean.split())
+    return clean[-limit:] if len(clean) > limit else clean
+
+
+def read_log_tail(path: pathlib.Path, limit: int) -> str:
+    """Read only a bounded tail before redaction; never load an unbounded worker log."""
+    byte_limit = max(limit * 4, 4096)
+    directory_fd = open_directory_nofollow(path.parent)
+    flags = os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
+    try:
+        fd = os.open(path.name, flags, dir_fd=directory_fd)
+        with os.fdopen(fd, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - byte_limit))
+            tail = handle.read(byte_limit).decode("utf-8", errors="replace")
+    finally:
+        os.close(directory_fd)
+    return concise(tail, limit)
+
+
+def open_directory_nofollow(directory: pathlib.Path) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent_fd = -1
+    try:
+        if directory.name == "runtime" and directory.parent.name == ".harness":
+            parent_fd = os.open(directory.parent, flags)
+            fd = os.open(directory.name, flags, dir_fd=parent_fd)
+        else:
+            fd = os.open(directory, flags)
+    except OSError as exc:
+        raise HarnessError(f"cannot safely open runtime directory: {type(exc).__name__}") from exc
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+    if not stat.S_ISDIR(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise HarnessError("runtime path is not a directory")
+    return fd
+
+
+def atomic_runtime_write(path: pathlib.Path, data: str, mode: int = 0o600) -> None:
+    directory_fd = open_directory_nofollow(path.parent)
+    tmp_name = f".{path.name}.{os.getpid()}.{time.time_ns()}"
+    fd = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(tmp_name, flags, mode, dir_fd=directory_fd)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            fd = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name, dir_fd=directory_fd)
+        os.close(directory_fd)
+
+
+def atomic_runtime_json(path: pathlib.Path, value: Any) -> None:
+    atomic_runtime_write(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def runtime_unlink(path: pathlib.Path) -> None:
+    directory_fd = open_directory_nofollow(path.parent)
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path.name, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def clear_directory_fd(directory_fd: int) -> None:
+    flags = os.O_RDONLY | (os.O_DIRECTORY if hasattr(os, "O_DIRECTORY") else 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    for name in os.listdir(directory_fd):
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                clear_directory_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def secure_log_file(path: pathlib.Path):
+    """Open a regular mode-0600 log through a no-follow parent directory fd."""
+    directory_fd = open_directory_nofollow(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+    except OSError as exc:
+        os.close(directory_fd)
+        raise HarnessError(f"cannot safely open runtime log {path.name}: {type(exc).__name__}") from exc
+    os.close(directory_fd)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        os.close(fd)
+        raise HarnessError(f"runtime log {path.name} is not a regular file")
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "w", encoding="utf-8")
+
+
+def stream_redacted(pipe, log) -> None:
+    carry = ""
+    while True:
+        chunk = pipe.read(4096)
+        if not chunk:
+            break
+        carry += chunk
+        if len(carry) > 512:
+            log.write(SECRET_VALUE.sub("[REDACTED]", carry[:-256]))
+            carry = carry[-256:]
+    if carry:
+        log.write(SECRET_VALUE.sub("[REDACTED]", carry))
+    log.flush()
+
+
+def run_logged(argv: list[str], root: pathlib.Path, log_path: pathlib.Path, timeout: int) -> int:
+    log = secure_log_file(log_path)
+    try:
+        proc = subprocess.Popen(argv, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, env=worker_environment())
+        if proc.stdout is None:
+            raise HarnessError("subprocess output pipe was not created")
+        reader = threading.Thread(target=stream_redacted, args=(proc.stdout, log), daemon=True)
+        reader.start()
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            rc = 124
+        reader.join(timeout=5)
+        if reader.is_alive():
+            raise HarnessError("subprocess log drain did not terminate")
+        os.fsync(log.fileno())
+        return rc
+    finally:
+        log.close()
+
+
+def emit(command: str, outcome: str, **fields: Any) -> None:
+    parts = [f"HARNESS {command} {outcome}"]
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        parts.append(f"{key}={json.dumps(value, ensure_ascii=False, separators=(',', ':'))}")
+    print(" ".join(parts))
+
+
+def run_capture(argv: list[str], cwd: pathlib.Path | None = None, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, timeout=timeout, check=False, env=env)
+
+
+def git_root(required: bool = True) -> pathlib.Path | None:
+    cp = run_capture(["git", "rev-parse", "--show-toplevel"])
+    if cp.returncode != 0:
+        if required:
+            raise HarnessError("current directory is not inside a Git repository")
+        return None
+    return pathlib.Path(cp.stdout.strip()).resolve()
+
+
+def paths(root: pathlib.Path, allow_unsafe_runtime: bool = False) -> dict[str, pathlib.Path]:
+    base = root / ".harness"
+    runtime = base / "runtime"
+    git_dir_result = run_capture(["git", "rev-parse", "--git-dir"], cwd=root)
+    if git_dir_result.returncode != 0:
+        raise HarnessError("cannot resolve Git metadata directory")
+    git_dir = pathlib.Path(git_dir_result.stdout.strip())
+    if not git_dir.is_absolute():
+        git_dir = (root / git_dir).resolve()
+    trusted = git_dir / "harness-control"
+    for directory in (base, trusted):
+        if directory.is_symlink():
+            raise HarnessError(f"refusing symlinked Harness directory: {directory}")
+    if runtime.is_symlink() and not allow_unsafe_runtime:
+        raise HarnessError(f"refusing symlinked Harness directory: {runtime}")
+    for name in ("config.toml", "state.json", "PROJECT_STATE.md", "CURRENT_STAGE.md"):
+        candidate = base / name
+        if candidate.is_symlink():
+            raise HarnessError(f"refusing symlinked Harness control file: {candidate}")
+    for name in ("config.toml", "state.json", "CURRENT_STAGE.md",
+                 "orchestrator-checkpoint.json", "implementation.json",
+                 "quality-gates.json", "review.json", "state.lock"):
+        candidate = trusted / name
+        if candidate.is_symlink():
+            raise HarnessError(f"refusing symlinked trusted control file: {candidate}")
+    return {
+        "base": base,
+        "runtime": runtime,
+        "config": base / "config.toml",
+        "state": base / "state.json",
+        "project": base / "PROJECT_STATE.md",
+        "stage": base / "CURRENT_STAGE.md",
+        "trusted": trusted,
+        "trusted_config": trusted / "config.toml",
+        "trusted_state": trusted / "state.json",
+        "trusted_stage": trusted / "CURRENT_STAGE.md",
+        "trusted_checkpoint": trusted / "orchestrator-checkpoint.json",
+        "trusted_implementation": trusted / "implementation.json",
+        "trusted_gates": trusted / "quality-gates.json",
+        "trusted_review": trusted / "review.json",
+        "lock": trusted / "state.lock",
+        "checkpoint": runtime / "orchestrator-checkpoint.json",
+    }
+
+
+def fsync_dir(directory: pathlib.Path) -> None:
+    if os.name != "posix":
+        return
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path: pathlib.Path, data: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = pathlib.Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        fsync_dir(path.parent)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def atomic_json(path: pathlib.Path, value: Any) -> None:
+    atomic_write(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+@contextlib.contextmanager
+def state_lock(p: dict[str, pathlib.Path]):
+    p["runtime"].mkdir(parents=True, exist_ok=True)
+    p["trusted"].mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(p["lock"], flags, 0o600)
+    handle = os.fdopen(fd, "a+")
+    try:
+        if os.name == "posix":
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if os.name == "posix":
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def load_json(path: pathlib.Path, max_bytes: int = 2 * 1024 * 1024) -> dict[str, Any]:
+    try:
+        if path.parent.name == "runtime" and path.parent.parent.name == ".harness":
+            directory_fd = open_directory_nofollow(path.parent)
+            flags = os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
+            try:
+                fd = os.open(path.name, flags, dir_fd=directory_fd)
+                with os.fdopen(fd, "rb") as handle:
+                    raw = handle.read(max_bytes + 1)
+            finally:
+                os.close(directory_fd)
+        else:
+            with path.open("rb") as handle:
+                raw = handle.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise HarnessError(f"JSON artifact exceeds {max_bytes} bytes: {path}")
+        value = json.loads(raw.decode("utf-8"))
+    except FileNotFoundError as exc:
+        raise HarnessError(f"missing {path}; run 'harness init'") from exc
+    except OSError as exc:
+        raise HarnessError(f"cannot safely read JSON artifact {path.name}: {type(exc).__name__}") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HarnessError(f"invalid JSON in {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise HarnessError(f"expected JSON object in {path}")
+    return value
+
+
+def load_state(p: dict[str, pathlib.Path], repair_mirror: bool = True) -> dict[str, Any]:
+    source = p["trusted_state"] if p["trusted_state"].exists() else p["state"]
+    state = load_json(source)
+    if state.get("workflow_state") not in STATES:
+        raise HarnessError("state.json contains an unknown workflow_state")
+    mirror = json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if source == p["trusted_state"] and repair_mirror:
+        atomic_runtime_write(p["state"], mirror)
+    return state
+
+
+def save_state(p: dict[str, pathlib.Path], state: dict[str, Any], mirror: bool = True) -> None:
+    state["updated_at"] = utc_now()
+    atomic_json(p["trusted_state"], state)
+    if mirror:
+        atomic_runtime_json(p["state"], state)
+
+
+def clear_trusted_evidence(p: dict[str, pathlib.Path]) -> None:
+    for key in ("trusted_implementation", "trusted_gates", "trusted_review"):
+        with contextlib.suppress(FileNotFoundError):
+            p[key].unlink()
+
+
+def record_transition(state: dict[str, Any], target: str, reason: str) -> None:
+    current = state["workflow_state"]
+    if target not in STATES or target not in TRANSITIONS.get(current, set()):
+        raise HarnessError(f"illegal state transition: {current} -> {target}")
+    state["workflow_state"] = target
+    events = state.setdefault("recent_transitions", [])
+    events.append({"from": current, "to": target, "reason": reason, "at": utc_now()})
+    del events[:-12]
+
+
+def transition(p: dict[str, pathlib.Path], state: dict[str, Any], target: str, reason: str) -> None:
+    record_transition(state, target, reason)
+    save_state(p, state)
+
+
+def load_config(p: dict[str, pathlib.Path]) -> dict[str, Any]:
+    if tomllib is None:
+        raise HarnessError("Python 3.11+ is required (tomllib unavailable)")
+    try:
+        source = p["trusted_config"] if p["trusted_config"].exists() else p["config"]
+        with source.open("rb") as handle:
+            cfg = tomllib.load(handle)
+    except FileNotFoundError as exc:
+        raise HarnessError("missing .harness/config.toml; run 'harness init'") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise HarnessError(f"invalid .harness/config.toml: {exc}") from exc
+    if cfg.get("config_version") != CONFIG_VERSION:
+        raise HarnessError(f"unsupported config_version={cfg.get('config_version')!r}")
+    codex = cfg.get("codex", {})
+    if codex.get("implementer_sandbox") != "workspace-write":
+        raise HarnessError("[codex].implementer_sandbox must be exactly 'workspace-write'")
+    if codex.get("reviewer_sandbox") != "read-only":
+        raise HarnessError("[codex].reviewer_sandbox must be exactly 'read-only'")
+    if codex.get("ephemeral") is not True:
+        raise HarnessError("[codex].ephemeral must be true")
+    return cfg
+
+
+def protected_snapshot(root: pathlib.Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    head = run_capture(["git", "rev-parse", "HEAD"], cwd=root).stdout.strip()
+    values: dict[str, Any] = {}
+    for pattern in cfg.get("protected_paths", []):
+        if not isinstance(pattern, str) or pattern.startswith((".git", ".harness/state", ".harness/runtime")):
+            continue
+        matches = list(root.glob(pattern)) if any(ch in pattern for ch in "*?[") else [root / pattern]
+        for path in matches:
+            if not path.is_file():
+                continue
+            relative = str(path.relative_to(root))
+            if path.name == ".env" or path.name.startswith(".env.") or SECRET_NAMES.search(relative):
+                stat = path.stat()
+                values[relative] = {"kind": "secret-metadata", "size": stat.st_size,
+                                    "mtime_ns": stat.st_mtime_ns, "mode": stat.st_mode & 0o777}
+            else:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                values[relative] = {"kind": "sha256", "digest": digest}
+    git_dir_result = run_capture(["git", "rev-parse", "--git-dir"], cwd=root)
+    git_metadata: dict[str, Any] = {}
+    if git_dir_result.returncode == 0:
+        git_dir = pathlib.Path(git_dir_result.stdout.strip())
+        if not git_dir.is_absolute():
+            git_dir = root / git_dir
+        for path in sorted(git_dir.rglob("*")):
+            key = str(path.relative_to(git_dir))
+            if key == "harness-control" or key.startswith("harness-control/"):
+                continue
+            if path.is_symlink():
+                git_metadata[key] = {"kind": "symlink", "target": os.readlink(path)}
+            elif path.is_file():
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                git_metadata[key] = {"kind": "sha256", "digest": digest.hexdigest()}
+    return {"git_head": head, "git_metadata": git_metadata, "files": values}
+
+
+def require_protected_unchanged(root: pathlib.Path, cfg: dict[str, Any], state: dict[str, Any]) -> None:
+    baseline = state.get("protected_baseline")
+    if not isinstance(baseline, dict):
+        raise HarnessError("missing protected-path baseline; restart the Stage safely")
+    if protected_snapshot(root, cfg) != baseline:
+        raise HarnessError("protected paths or Git HEAD changed during the Slice")
+
+
+def worktree_fingerprint(root: pathlib.Path) -> str:
+    """Bind gates/review to changed-file content without reading credential-shaped files."""
+    env = dict(os.environ)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    cp = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        check=False, env=env)
+    if cp.returncode != 0:
+        raise HarnessError("failed to fingerprint Git worktree")
+    digest = hashlib.sha256(cp.stdout)
+    for token in cp.stdout.split(b"\0"):
+        if not token:
+            continue
+        raw_path = token[3:] if len(token) >= 3 and token[2:3] == b" " else token
+        relative = raw_path.decode("utf-8", errors="surrogateescape")
+        if relative.startswith((".git/", ".harness/")):
+            continue
+        path = root / relative
+        digest.update(raw_path)
+        if path.is_file():
+            if path.name == ".env" or path.name.startswith(".env.") or SECRET_NAMES.search(relative):
+                stat = path.stat()
+                metadata = f"secret-metadata:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_mode & 0o777}"
+                digest.update(metadata.encode())
+            else:
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def q(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def toml_array(values: Iterable[str]) -> str:
+    return "[" + ", ".join(q(str(v)) for v in values) + "]"
+
+
+def detect_project(root: pathlib.Path) -> dict[str, Any]:
+    context_candidates = [
+        "AGENTS.md", "CLAUDE.md", ".cursorrules", "ARCHITECTURE.md", "README.md",
+        "README.rst", "README.txt", "docs/quality.md", "docs/exec-plans/README.md",
+    ]
+    context = [name for name in context_candidates if (root / name).is_file()]
+    ci = []
+    workflows = root / ".github" / "workflows"
+    if workflows.is_dir():
+        ci = sorted(str(x.relative_to(root)) for x in workflows.iterdir()
+                    if x.suffix.lower() in {".yml", ".yaml"})
+    detected: list[str] = []
+    workspace_members: list[str] = []
+    build_entrypoints: list[str] = []
+    commands: dict[str, list[str]] = {}
+    project_type = "generic"
+    cargo = root / "Cargo.toml"
+    if cargo.is_file():
+        detected.append("Cargo.toml")
+        try:
+            manifest = tomllib.loads(cargo.read_text(encoding="utf-8")) if tomllib else {}
+        except Exception:
+            manifest = {}
+        workspace = isinstance(manifest.get("workspace"), dict)
+        if workspace:
+            members = manifest.get("workspace", {}).get("members", [])
+            if isinstance(members, list):
+                workspace_members = [str(member) for member in members if isinstance(member, str)]
+        project_type = "rust-workspace" if workspace else "rust"
+        lock = ["--locked"] if (root / "Cargo.lock").is_file() else []
+        commands = {
+            "formatter": ["cargo", "fmt", "--all", "--check"],
+            "lint": ["cargo", "clippy", *lock, "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"],
+            "check": ["cargo", "check", *lock, "--workspace", "--all-targets", "--all-features"],
+            "unit_test": ["cargo", "test", *lock, "--workspace"],
+            "integration_test": ["cargo", "test", *lock, "--workspace", "--tests"],
+        }
+        for name in ("Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"):
+            if (root / name).is_file():
+                detected.append(name)
+    elif (root / "pyproject.toml").is_file():
+        detected.append("pyproject.toml")
+        project_type = "python"
+        commands = {"formatter": ["python", "-m", "ruff", "format", "--check", "."],
+                    "lint": ["python", "-m", "ruff", "check", "."],
+                    "check": ["python", "-m", "compileall", "-q", "."],
+                    "unit_test": ["python", "-m", "pytest", "-q"],
+                    "integration_test": []}
+    elif (root / "package.json").is_file():
+        detected.append("package.json")
+        project_type = "node"
+        try:
+            scripts = json.loads((root / "package.json").read_text(encoding="utf-8")).get("scripts", {})
+        except Exception:
+            scripts = {}
+        package_runner = "npm"
+        commands = {
+            "formatter": [package_runner, "run", "format", "--", "--check"] if "format" in scripts else [],
+            "lint": [package_runner, "run", "lint"] if "lint" in scripts else [],
+            "check": [package_runner, "run", "typecheck"] if "typecheck" in scripts else ([package_runner, "run", "build"] if "build" in scripts else []),
+            "unit_test": [package_runner, "test", "--", "--runInBand"] if "test" in scripts else [],
+            "integration_test": [package_runner, "run", "test:integration"] if "test:integration" in scripts else [],
+        }
+    elif (root / "go.mod").is_file():
+        detected.append("go.mod")
+        project_type = "go"
+        commands = {"formatter": ["harness", "_gofmt-check"], "lint": ["go", "vet", "./..."],
+                    "check": ["go", "test", "-run", "^$", "./..."],
+                    "unit_test": ["go", "test", "./..."], "integration_test": []}
+    else:
+        commands = {name: [] for name in ("formatter", "lint", "check", "unit_test", "integration_test")}
+    for name in ("Makefile", "Justfile", "package.json", "pyproject.toml", "go.mod"):
+        if (root / name).is_file() and name not in detected:
+            detected.append(name)
+    if (root / "scripts" / "verify").is_file():
+        build_entrypoints.append("scripts/verify")
+    return {"project_type": project_type, "context": context, "ci": ci,
+            "detected": detected, "workspace_members": workspace_members,
+            "build_entrypoints": build_entrypoints, "commands": commands}
+
+
+def render_config(root: pathlib.Path, facts: dict[str, Any]) -> str:
+    commands = facts["commands"]
+    protected = [".git/", ".env", ".env.*", ".harness/config.toml",
+                 ".harness/state.json", ".harness/runtime/",
+                 "AGENTS.md", "ARCHITECTURE.md"]
+    return f'''config_version = {CONFIG_VERSION}
+harness_version = {q(HARNESS_VERSION)}
+project_name = {q(root.name)}
+project_type = {q(facts["project_type"])}
+context_files = {toml_array(facts["context"])}
+ci_files = {toml_array(facts["ci"])}
+detected_files = {toml_array(facts["detected"])}
+workspace_members = {toml_array(facts["workspace_members"])}
+build_entrypoints = {toml_array(facts["build_entrypoints"])}
+protected_paths = {toml_array(protected)}
+max_slice_attempts = 3
+error_excerpt_limit = 1200
+
+[commands]
+formatter = {toml_array(commands["formatter"])}
+lint = {toml_array(commands["lint"])}
+check = {toml_array(commands["check"])}
+unit_test = {toml_array(commands["unit_test"])}
+integration_test = {toml_array(commands["integration_test"])}
+
+[codex]
+command = ["codex"]
+implementer_sandbox = "workspace-write"
+reviewer_sandbox = "read-only"
+ephemeral = true
+
+[context_maintenance]
+enabled = true
+idle_compaction_threshold = 0.45
+max_compactions_per_worker_run = 1
+min_tokens_since_last_compaction = 20000
+rehydrate_after_compaction = true
+'''
+
+
+def read_approved_plan(root: pathlib.Path, raw_path: str) -> str:
+    candidate = pathlib.Path(raw_path)
+    if candidate.is_symlink():
+        raise HarnessError("approved plan file must not be a symlink")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise HarnessError("approved plan file does not exist") from exc
+    project_root = root.resolve()
+    if not resolved.is_file() or not resolved.is_relative_to(project_root):
+        raise HarnessError("approved plan file must be a regular file inside the Git project")
+    relative = resolved.relative_to(project_root)
+    if any(part in {".git", ".harness"} for part in relative.parts):
+        raise HarnessError("approved plan file must not be inside .git or .harness")
+    relative_text = str(relative)
+    if resolved.name == ".env" or resolved.name.startswith(".env.") or SECRET_NAMES.search(relative_text):
+        raise HarnessError("approved plan path is credential-shaped and will not be read")
+    if resolved.stat().st_size > 1024 * 1024:
+        raise HarnessError("approved plan file exceeds 1 MiB")
+    plan = resolved.read_text(encoding="utf-8")
+    if not plan.strip():
+        raise HarnessError("the approved Stage plan file is empty")
+    return plan
+
+
+def initial_state() -> dict[str, Any]:
+    now = utc_now()
+    return {"state_version": 1, "harness_version": HARNESS_VERSION,
+            "workflow_state": "STAGE_DISCUSSION", "stage_id": None,
+            "stage_title": None, "slice_id": None, "attempt": 0,
+            "gates_passed": False, "review_passed": False,
+            "validated_worktree": None, "worker": None,
+            "created_at": now, "updated_at": now,
+            "recent_transitions": []}
+
+
+def init_project(_args: argparse.Namespace) -> None:
+    root = git_root(True)
+    p = paths(root)
+    p["runtime"].mkdir(parents=True, exist_ok=True)
+    facts = detect_project(root)
+    created: list[str] = []
+    files = {
+        p["config"]: render_config(root, facts),
+        p["state"]: json.dumps(initial_state(), indent=2, sort_keys=True) + "\n",
+        p["project"]: f"# Project State\n\nProject: {root.name}\n\nInitialized: {utc_now()}\n\n## Current status\n\nHarness initialized; no Stage approved.\n",
+        p["stage"]: "# Current Stage\n\nNo Stage has been approved. Discuss direction, architecture, Stage, and Slices with the user first.\n",
+    }
+    for path, content in files.items():
+        if not path.exists():
+            atomic_write(path, content)
+            created.append(str(path.relative_to(root)))
+    p["trusted"].mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not p["trusted_config"].exists():
+        atomic_write(p["trusted_config"], p["config"].read_text(encoding="utf-8"), mode=0o600)
+    if not p["trusted_state"].exists():
+        atomic_write(p["trusted_state"], p["state"].read_text(encoding="utf-8"), mode=0o600)
+    if not p["trusted_stage"].exists():
+        atomic_write(p["trusted_stage"], p["stage"].read_text(encoding="utf-8"), mode=0o600)
+    ignore = root / ".gitignore"
+    old = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
+    entry = "/.harness/runtime/"
+    if entry not in {line.strip() for line in old.splitlines()}:
+        suffix = "" if not old or old.endswith("\n") else "\n"
+        atomic_write(ignore, old + suffix + entry + "\n")
+        created.append(".gitignore")
+    emit("init", "ok", project_type=facts["project_type"], created=created)
+
+
+def executable_version(name: str, args: list[str]) -> tuple[bool, str]:
+    path = shutil.which(name)
+    if not path:
+        return False, "missing"
+    try:
+        cp = run_capture([path, *args], timeout=20)
+        return cp.returncode == 0, concise(cp.stdout, 240)
+    except Exception as exc:
+        return False, concise(str(exc), 240)
+
+
+def doctor(_args: argparse.Namespace) -> None:
+    root = git_root(False)
+    checks: dict[str, Any] = {}
+    for name, argv in (("git", ["--version"]), ("python", ["--version"]),
+                       ("hermes", ["--version"]), ("codex", ["--version"])):
+        executable = sys.executable if name == "python" else name
+        checks[name] = executable_version(executable, argv)
+    codex_help = run_capture(["codex", "exec", "--help"]).stdout if shutil.which("codex") else ""
+    checks["codex_capabilities"] = all(flag in codex_help for flag in
+        ("--ephemeral", "--output-schema", "--output-last-message", "read-only", "workspace-write"))
+    hermes_version = checks["hermes"][1]
+    version_match = re.search(r"\bv?(\d+\.\d+\.\d+)\b", hermes_version)
+    checks["context_plugin_compat"] = bool(version_match and version_match.group(1) == "0.19.1")
+    hermes_home = pathlib.Path(os.environ.get("HERMES_HOME", str(pathlib.Path.home() / ".hermes")))
+    plugin_path = hermes_home / "plugins" / "codex-harness-context"
+    checks["context_plugin_installed"] = (plugin_path / "plugin.yaml").is_file() and (plugin_path / "__init__.py").is_file()
+    plugin_list = run_capture(["hermes", "plugins", "list", "--plain", "--no-bundled"]).stdout if shutil.which("hermes") else ""
+    checks["context_plugin_enabled"] = any(
+        "codex-harness-context" in line and line.strip().startswith("enabled")
+        for line in plugin_list.splitlines()
+    )
+    checks["global_skill_installed"] = (
+        hermes_home / "skills" / "software-development" / "codex-harness" / "SKILL.md"
+    ).is_file()
+    try:
+        enable_child_subreaper()
+        checks["linux_child_subreaper"] = True
+    except HarnessError:
+        checks["linux_child_subreaper"] = False
+    probe_cgroup: pathlib.Path | None = None
+    try:
+        probe_cgroup = create_worker_cgroup()
+        probe = subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).resolve()), "_cgroup-exec",
+             str(probe_cgroup), "--", "/usr/bin/true"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=worker_environment(), timeout=10, check=False,
+        )
+        destroy_worker_cgroup(probe_cgroup, kill=True)
+        probe_cgroup = None
+        checks["cgroup_v2_worker_containment"] = probe.returncode == 0
+    except (HarnessError, OSError, subprocess.SubprocessError):
+        checks["cgroup_v2_worker_containment"] = False
+    finally:
+        if probe_cgroup is not None:
+            with contextlib.suppress(HarnessError):
+                destroy_worker_cgroup(probe_cgroup, kill=True)
+    if root and paths(root)["config"].exists():
+        try:
+            cfg = load_config(paths(root))
+            checks["project_config"] = cfg.get("harness_version") == HARNESS_VERSION
+        except Exception:
+            checks["project_config"] = False
+    ok = all(v[0] if isinstance(v, tuple) else bool(v) for v in checks.values())
+    emit("doctor", "ok" if ok else "degraded", checks=checks)
+    if not ok:
+        raise HarnessError("one or more doctor checks failed or require compatibility review")
+
+
+def status(args: argparse.Namespace) -> None:
+    root = git_root(True)
+    p = paths(root)
+    state = load_state(p)
+    checkpoint_path = p["trusted_checkpoint"] if p["trusted_checkpoint"].exists() else p["checkpoint"]
+    checkpoint = load_json(checkpoint_path) if checkpoint_path.exists() else None
+    value = {"project": root.name, "workflow_state": state["workflow_state"],
+             "stage_id": state.get("stage_id"), "slice_id": state.get("slice_id"),
+             "attempt": state.get("attempt"), "gates_passed": state.get("gates_passed"),
+             "review_passed": state.get("review_passed"), "worker": state.get("worker"),
+             "checkpoint": checkpoint}
+    if args.json:
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    else:
+        emit("status", "ok", **value)
+
+
+def start_stage(args: argparse.Namespace) -> None:
+    root = git_root(True)
+    p = paths(root)
+    plan = read_approved_plan(root, args.plan_file)
+    with state_lock(p):
+        state = load_state(p)
+        if state["workflow_state"] not in {"STAGE_DISCUSSION", "STAGE_COMPLETED"}:
+            raise HarnessError("start-stage requires STAGE_DISCUSSION or STAGE_COMPLETED")
+        atomic_write(p["trusted_config"], p["config"].read_text(encoding="utf-8"), mode=0o600)
+        cfg = load_config(p)
+        body = f"# Current Stage\n\n- Stage: {args.stage}\n- Title: {args.title}\n- Current Slice: {args.slice}\n- Approved: {utc_now()}\n\n## Plan and acceptance criteria\n\n{plan}\n"
+        atomic_write(p["stage"], body)
+        atomic_write(p["trusted_stage"], body, mode=0o600)
+        clear_trusted_evidence(p)
+        state.update({"stage_id": args.stage, "stage_title": args.title,
+                      "slice_id": args.slice, "attempt": 0,
+                      "gates_passed": False, "review_passed": False, "worker": None,
+                      "protected_baseline": protected_snapshot(root, cfg)})
+        record_transition(state, "STAGE_APPROVED", "user-approved Stage recorded")
+        record_transition(state, "SLICE_READY", "first approved Slice ready")
+        save_state(p, state)
+    emit("start-stage", "ok", state="SLICE_READY", stage=args.stage, slice=args.slice,
+         max_attempts=cfg["max_slice_attempts"])
+
+
+def skill_root() -> pathlib.Path:
+    return pathlib.Path(__file__).resolve().parent.parent
+
+
+def schema_path(role: str) -> pathlib.Path:
+    return skill_root() / "schemas" / ("implementation.schema.json" if role == "implementer" else "review.schema.json")
+
+
+def validate_schema_value(value: Any, schema: dict[str, Any], where: str = "$") -> None:
+    expected = schema.get("type")
+    if expected == "object":
+        if not isinstance(value, dict):
+            raise HarnessError(f"{where} must be an object")
+        for key in schema.get("required", []):
+            if key not in value:
+                raise HarnessError(f"{where}.{key} is required")
+        if schema.get("additionalProperties") is False:
+            extras = set(value) - set(schema.get("properties", {}))
+            if extras:
+                raise HarnessError(f"{where} has unexpected fields: {sorted(extras)}")
+        for key, item_schema in schema.get("properties", {}).items():
+            if key in value:
+                validate_schema_value(value[key], item_schema, f"{where}.{key}")
+    elif expected == "array":
+        if not isinstance(value, list):
+            raise HarnessError(f"{where} must be an array")
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            raise HarnessError(f"{where} must contain at least {schema['minItems']} items")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            raise HarnessError(f"{where} must contain at most {schema['maxItems']} items")
+        for idx, item in enumerate(value):
+            validate_schema_value(item, schema.get("items", {}), f"{where}[{idx}]")
+    elif expected == "string":
+        if not isinstance(value, str):
+            raise HarnessError(f"{where} must be a string")
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            raise HarnessError(f"{where} is shorter than minLength={schema['minLength']}")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            raise HarnessError(f"{where} exceeds maxLength={schema['maxLength']}")
+    elif expected == "integer":
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise HarnessError(f"{where} must be an integer")
+        if "minimum" in schema and value < schema["minimum"]:
+            raise HarnessError(f"{where} must be >= {schema['minimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            raise HarnessError(f"{where} must be <= {schema['maximum']}")
+    elif expected == "boolean" and not isinstance(value, bool):
+        raise HarnessError(f"{where} must be a boolean")
+    if "enum" in schema and value not in schema["enum"]:
+        raise HarnessError(f"{where} must be one of {schema['enum']}")
+
+
+def validate_report(path: pathlib.Path, schema_file: pathlib.Path) -> dict[str, Any]:
+    report = load_json(path)
+    schema = load_json(schema_file)
+    validate_schema_value(report, schema)
+    if schema_file.name == "implementation.schema.json":
+        if report.get("status") == "completed" and report.get("blockers"):
+            raise HarnessError("a completed implementation must contain no blockers")
+        if report.get("status") == "blocked" and not report.get("blockers"):
+            raise HarnessError("a blocked implementation must describe at least one blocker")
+    if schema_file.name == "review.schema.json" and report.get("verdict") == "approved" and report.get("findings"):
+        raise HarnessError("an approved review must contain no findings")
+    if schema_file.name == "review.schema.json" and report.get("verdict") == "changes_required" and not report.get("findings"):
+        raise HarnessError("a changes-required review must contain at least one finding")
+    if schema_file.name == "quality-gates.schema.json":
+        gates = report.get("gates", [])
+        executed = [gate for gate in gates if gate.get("status") != "skipped"]
+        if not executed:
+            raise HarnessError("quality-gate report must contain at least one executed gate")
+        passed = all(gate.get("status") == "passed" for gate in executed)
+        if (report.get("status") == "passed") != passed:
+            raise HarnessError("quality-gate status is inconsistent with individual gate results")
+    return report
+
+
+def render_prompt(root: pathlib.Path, p: dict[str, pathlib.Path], cfg: dict[str, Any],
+                  state: dict[str, Any], role: str) -> str:
+    template_name = "implementation-prompt.md" if role == "implementer" else "review-prompt.md"
+    template = (skill_root() / "templates" / template_name).read_text(encoding="utf-8")
+    stage_source = p["trusted_stage"] if p["trusted_stage"].exists() else p["stage"]
+    stage_text = stage_source.read_text(encoding="utf-8")
+    context_files = "\n".join(f"- {x}" for x in cfg.get("context_files", [])) or "- none"
+    protected = "\n".join(f"- {x}" for x in cfg.get("protected_paths", [])) or "- none"
+    replacements = {"{{PROJECT_ROOT}}": str(root), "{{STAGE_ID}}": str(state.get("stage_id")),
+                    "{{SLICE_ID}}": str(state.get("slice_id")), "{{ATTEMPT}}": str(state.get("attempt")),
+                    "{{CONTEXT_FILES}}": context_files, "{{PROTECTED_PATHS}}": protected,
+                    "{{CURRENT_STAGE}}": stage_text}
+    for key, value in replacements.items():
+        template = template.replace(key, value)
+    return template
+
+
+def process_identity(pid: Any) -> dict[str, Any] | None:
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        stat_text = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        remainder = stat_text[stat_text.rfind(")") + 2:].split()
+        start_time = remainder[19]
+        executable = os.readlink(f"/proc/{pid}/exe")
+        return {"start_time": start_time, "executable": executable, "session_id": os.getsid(pid)}
+    except OSError:
+        return None
+
+
+def process_alive(pid: Any, expected: Any) -> bool:
+    return isinstance(expected, dict) and process_identity(pid) == expected
+
+
+def codex_argv(cfg: dict[str, Any], root: pathlib.Path, role: str,
+               schema: pathlib.Path, output: pathlib.Path) -> list[str]:
+    configured = cfg.get("codex", {}).get("command", ["codex"])
+    if not isinstance(configured, list) or not configured or not all(isinstance(x, str) for x in configured):
+        raise HarnessError("[codex].command must be a non-empty string array")
+    override = os.environ.get("HARNESS_CODEX_BIN")
+    base = [override] if override else list(configured)
+    sandbox = "workspace-write" if role == "implementer" else "read-only"
+    argv = [*base, "exec", "--sandbox", sandbox, "--ephemeral"]
+    argv += ["--output-schema", str(schema), "--output-last-message", str(output),
+             "--color", "never", "-C", str(root), "-"]
+    return argv
+
+
+def worker_environment() -> dict[str, str]:
+    """Pass only non-secret process context; Codex authentication should use its protected home."""
+    allowed = {"HOME", "PATH", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR",
+               "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "CODEX_HOME",
+               "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}
+    result = {key: value for key, value in os.environ.items()
+              if key in allowed or key.startswith("LC_")}
+    result["GIT_OPTIONAL_LOCKS"] = "0"
+    return result
+
+
+def write_checkpoint(p: dict[str, pathlib.Path], state: dict[str, Any], role: str,
+                     status_value: str, pid: int | None, report: pathlib.Path,
+                     wake_action: str, mirror: bool = True) -> None:
+    cfg = load_config(p)
+    cm = cfg.get("context_maintenance", {})
+    value = {"stage_id": state.get("stage_id"), "slice_id": state.get("slice_id"),
+             "workflow_state": state.get("workflow_state"), "worker_role": role,
+             "worker_status": status_value, "worker_session_id": None,
+             "process_id": pid, "process_identity": process_identity(pid),
+             "worker_cgroup": (state.get("worker") or {}).get("cgroup"),
+             "attempt": state.get("attempt"),
+             "expected_output_file": str(report), "next_action_after_completion": wake_action,
+             "unresolved_findings": state.get("unresolved_findings", []),
+             "important_user_constraints": ["Do not launch unapproved work", "Do not expose worker logs or secrets"],
+             "compactions_this_worker_run": 0,
+             "max_compactions_per_worker_run": cm.get("max_compactions_per_worker_run", 1),
+             "updated_at": utc_now()}
+    atomic_json(p["trusted_checkpoint"], value)
+    if mirror:
+        atomic_runtime_json(p["checkpoint"], value)
+
+
+def mark_worker_blocked(p: dict[str, pathlib.Path], role: str,
+                        proc: subprocess.Popen[str], reason: str) -> None:
+    with state_lock(p):
+        state = load_state(p, repair_mirror=False)
+        worker = dict(state.get("worker") or {})
+        worker.update({"role": role, "pid": proc.pid, "status": "failed"})
+        state["worker"] = worker
+        if state["workflow_state"] in {"IMPLEMENTING", "REVIEWING"}:
+            record_transition(state, "BLOCKED", reason)
+        save_state(p, state, mirror=False)
+
+
+def cgroup_exec(args: argparse.Namespace) -> None:
+    cgroup = validate_worker_cgroup(pathlib.Path(args.cgroup))
+    command = list(args.argv)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise HarnessError("cgroup worker command is empty")
+    try:
+        (cgroup / "cgroup.procs").write_text(str(os.getpid()), encoding="ascii")
+    except OSError as exc:
+        raise HarnessError(f"cannot enter worker cgroup: {type(exc).__name__}") from exc
+    isolated = ["/usr/bin/unshare", "--user", "--map-root-user", "--mount", "--cgroup",
+                "--pid", "--mount-proc", "--fork", "--kill-child=KILL", sys.executable,
+                str(pathlib.Path(__file__).resolve()), "_isolated-exec",
+                f"/run/user/{os.getuid()}", "--", *command]
+    os.execvpe(isolated[0], isolated, os.environ)
+
+
+def isolated_exec(args: argparse.Namespace) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    mount_flags = 1 | 2 | 4 | 8  # MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC
+    targets = [pathlib.Path("/sys/fs/cgroup")]
+    runtime_dir = pathlib.Path(args.runtime_dir)
+    if runtime_dir.is_dir():
+        targets.append(runtime_dir)
+    for target in targets:
+        encoded = os.fsencode(target)
+        result = libc.mount(b"tmpfs", encoded, b"tmpfs", mount_flags, b"mode=0555")
+        if result != 0:
+            error = ctypes.get_errno()
+            raise HarnessError(f"cannot hide containment control path: errno {error}")
+    command = list(args.argv)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise HarnessError("isolated worker command is empty")
+    setpriv = ["/usr/bin/setpriv", "--nnp", "--bounding-set=-all", "--inh-caps=-all",
+               "--ambient-caps=-all",
+               "--securebits=+noroot,+noroot_locked,+no_setuid_fixup,+no_setuid_fixup_locked",
+               *command]
+    os.execvpe(setpriv[0], setpriv, os.environ)
+
+
+def run_worker(args: argparse.Namespace, role: str) -> None:
+    root = git_root(True)
+    p = paths(root)
+    cfg = load_config(p)
+    max_attempts = int(cfg.get("max_slice_attempts", 3))
+    suffix = "-dry-run" if args.dry_run else ""
+    report = p["runtime"] / (f"{role}{suffix}.json" if args.dry_run else REPORT_FILES[role])
+    prompt_file = p["runtime"] / f"{role}{suffix}-prompt.md"
+    log_file = p["runtime"] / f"{role}{suffix}.log"
+    command_file = p["runtime"] / f"{role}{suffix}-command.json"
+    proc: subprocess.Popen[str] | None = None
+    worker_cgroup: pathlib.Path | None = None
+    log_handle = None
+    with state_lock(p):
+        state = load_state(p)
+        allowed = {"SLICE_READY", "CHANGES_REQUIRED"} if role == "implementer" else {"VALIDATING"}
+        if state["workflow_state"] not in allowed:
+            raise HarnessError(f"run-{role} not allowed from {state['workflow_state']}")
+        if role == "reviewer" and not state.get("gates_passed"):
+            raise HarnessError("reviewer requires passing deterministic gates")
+        if args.dry_run:
+            prompt = render_prompt(root, p, cfg, state, role)
+            atomic_runtime_write(prompt_file, prompt)
+            argv = codex_argv(cfg, root, role, schema_path(role), report)
+            sandbox = "workspace-write" if role == "implementer" else "read-only"
+            atomic_runtime_json(command_file, {"argv": argv, "sandbox": sandbox,
+                                               "ephemeral": True, "dry_run": True})
+            atomic_runtime_write(log_file, "SYNTHETIC WORKER OUTPUT ISOLATION CHECK\n")
+            atomic_runtime_json(report, {"dry_run": True, "would_launch": argv,
+                                         "workflow_state_unchanged": state["workflow_state"]})
+            emit(f"run-{role}", "dry-run", state=state["workflow_state"],
+                 sandbox=sandbox, report=str(report.relative_to(root)))
+            return
+        enable_child_subreaper()
+        if role == "implementer":
+            clear_trusted_evidence(p)
+            if int(state.get("attempt", 0)) >= max_attempts:
+                transition(p, state, "HUMAN_CHECKPOINT", "Slice attempt limit exceeded")
+                raise HarnessError("max_slice_attempts exceeded; HUMAN_CHECKPOINT required")
+            state["attempt"] = int(state.get("attempt", 0)) + 1
+            state["gates_passed"] = False
+            state["review_passed"] = False
+            state["validated_worktree"] = None
+            transition(p, state, "IMPLEMENTING", "Codex Implementer launch")
+        else:
+            transition(p, state, "REVIEWING", "independent Codex Reviewer launch")
+        state = load_state(p)
+        worker_cgroup = create_worker_cgroup()
+        state["worker"] = {"role": role, "pid": None, "status": "launching",
+                           "process_identity": None, "cgroup": str(worker_cgroup),
+                           "expected_output": str(report), "started_at": utc_now()}
+        save_state(p, state, mirror=False)
+        write_checkpoint(p, state, role, "launching", None, report,
+                         "run-gates" if role == "implementer" else "approve-slice",
+                         mirror=False)
+        prompt = render_prompt(root, p, cfg, state, role)
+        atomic_runtime_write(prompt_file, prompt)
+        runtime_unlink(report)
+        argv = codex_argv(cfg, root, role, schema_path(role), report)
+        sandbox = "workspace-write" if role == "implementer" else "read-only"
+        atomic_runtime_json(command_file, {"argv": argv, "sandbox": sandbox, "ephemeral": True,
+                                           "cgroup": str(worker_cgroup)})
+        log_handle = secure_log_file(log_file)
+        launch_argv = [sys.executable, str(pathlib.Path(__file__).resolve()), "_cgroup-exec",
+                       str(worker_cgroup), "--", *argv]
+        with prompt_file.open("r", encoding="utf-8") as stdin:
+            try:
+                proc = subprocess.Popen(launch_argv, cwd=root, stdin=stdin, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                                        env=worker_environment())
+            except OSError as exc:
+                destroy_worker_cgroup(worker_cgroup, kill=True)
+                log_handle.close()
+                log_handle = None
+                transition(p, state, "BLOCKED", f"failed to start Codex {role}")
+                raise HarnessError(concise(str(exc), int(cfg.get("error_excerpt_limit", 1200)))) from exc
+            identity = process_identity(proc.pid)
+            state["worker"] = {"role": role, "pid": proc.pid, "status": "running",
+                               "process_identity": identity, "expected_output": str(report),
+                               "cgroup": str(worker_cgroup),
+                               "started_at": utc_now()}
+            try:
+                save_state(p, state, mirror=False)
+                write_checkpoint(p, state, role, "running", proc.pid, report,
+                                 "run-gates" if role == "implementer" else "approve-slice",
+                                 mirror=False)
+            except BaseException as exc:
+                terminate_worker_tree(proc, cgroup=worker_cgroup)
+                log_handle.close()
+                log_handle = None
+                state["worker"]["status"] = "failed"
+                record_transition(state, "BLOCKED", f"failed to persist Codex {role} launch")
+                save_state(p, state, mirror=False)
+                if isinstance(exc, HarnessError):
+                    raise
+                raise HarnessError(f"failed to persist Codex {role} launch: {type(exc).__name__}") from exc
+
+    # Codex wait is intentionally outside the state lock. This keeps status,
+    # context maintenance, and recovery responsive while workflow_state still
+    # prevents a duplicate worker launch.
+    if proc is not None:
+        if proc.stdout is None or log_handle is None:
+            raise HarnessError("Codex worker output pipe was not created")
+        try:
+            stream_errors: list[BaseException] = []
+
+            def pump_output() -> None:
+                try:
+                    stream_redacted(proc.stdout, log_handle)
+                except BaseException as exc:
+                    stream_errors.append(exc)
+
+            pump = threading.Thread(target=pump_output, name=f"harness-{role}-output", daemon=True)
+            pump.start()
+            while proc.poll() is None and not stream_errors:
+                time.sleep(0.02)
+            if stream_errors:
+                terminate_worker_tree(proc, cgroup=worker_cgroup)
+            else:
+                proc.wait()
+                terminate_worker_tree(proc, parent_waited=True, cgroup=worker_cgroup)
+            pump.join(timeout=2.0)
+            if pump.is_alive():
+                with contextlib.suppress(Exception):
+                    proc.stdout.close()
+                pump.join(timeout=0.5)
+            if pump.is_alive():
+                raise HarnessError(f"Codex {role} output pump did not terminate")
+            if stream_errors:
+                raise stream_errors[0]
+            os.fsync(log_handle.fileno())
+            log_handle.close()
+            log_handle = None
+            rc = int(proc.returncode if proc.returncode is not None else 1)
+        except BaseException as exc:
+            terminate_worker_tree(proc, cgroup=worker_cgroup)
+            if log_handle is not None:
+                with contextlib.suppress(Exception):
+                    log_handle.close()
+                log_handle = None
+            mark_worker_blocked(p, role, proc, f"Codex {role} lifecycle failure")
+            if isinstance(exc, HarnessError):
+                raise
+            raise HarnessError(f"Codex {role} lifecycle failure: {type(exc).__name__}") from exc
+        snapshot = load_state(p, repair_mirror=False)
+        if rc != 0:
+            mark_worker_blocked(p, role, proc, f"Codex {role} exited {rc}")
+            write_checkpoint(p, load_state(p, repair_mirror=False), role, "failed",
+                             proc.pid, report, "recover", mirror=False)
+            try:
+                excerpt = read_log_tail(log_file, int(cfg.get("error_excerpt_limit", 1200)))
+                atomic_runtime_write(p["runtime"] / f"{role}-error-summary.txt", excerpt + "\n")
+            except HarnessError:
+                excerpt = f"Codex {role} exited {rc}; runtime log unavailable"
+            raise HarnessError(f"Codex {role} failed: {excerpt}")
+        try:
+            write_checkpoint(p, snapshot, role, "completed", proc.pid, report,
+                             "run-gates" if role == "implementer" else "approve-slice")
+        except HarnessError:
+            mark_worker_blocked(p, role, proc, f"Codex {role} runtime integrity failure")
+            raise
+
+    try:
+        result = validate_report(report, schema_path(role))
+    except HarnessError:
+        if proc is not None:
+            mark_worker_blocked(p, role, proc, f"Codex {role} produced an invalid structured handoff")
+        raise
+    atomic_json(p["trusted_implementation" if role == "implementer" else "trusted_review"], result)
+    with state_lock(p):
+        state = load_state(p)
+        state["worker"] = {"role": role, "status": "completed", "completed_at": utc_now(),
+                           "expected_output": str(report)}
+        if role == "implementer":
+            if result["status"] == "completed":
+                if state["workflow_state"] == "IMPLEMENTING":
+                    transition(p, state, "VALIDATING", "Implementer handoff accepted")
+                elif state["workflow_state"] == "VALIDATING":
+                    save_state(p, state)
+                else:
+                    raise HarnessError(f"Implementer completed after incompatible state {state['workflow_state']}")
+            else:
+                if state["workflow_state"] == "IMPLEMENTING":
+                    transition(p, state, "BLOCKED", "Implementer reported blocked")
+                else:
+                    save_state(p, state)
+        else:
+            if result["verdict"] == "approved":
+                state["review_passed"] = True
+                state["unresolved_findings"] = []
+                save_state(p, state)
+            elif result["verdict"] == "blocked":
+                state["review_passed"] = False
+                state["unresolved_findings"] = result.get("findings", [])
+                if state["workflow_state"] == "REVIEWING":
+                    transition(p, state, "BLOCKED", "Reviewer reported an access or tooling blocker")
+                else:
+                    save_state(p, state)
+            else:
+                state["review_passed"] = False
+                state["unresolved_findings"] = result.get("findings", [])
+                if state["workflow_state"] == "REVIEWING":
+                    transition(p, state, "CHANGES_REQUIRED", "Reviewer requested changes")
+                else:
+                    save_state(p, state)
+    emit(f"run-{role}", "ok", state=load_state(p)["workflow_state"], report=str(report.relative_to(root)))
+
+
+def run_gates(_args: argparse.Namespace) -> None:
+    root = git_root(True)
+    p = paths(root)
+    cfg = load_config(p)
+    with state_lock(p):
+        state = load_state(p)
+        if state["workflow_state"] != "VALIDATING":
+            raise HarnessError("run-gates requires VALIDATING")
+        results = []
+        all_pass = True
+        executed = 0
+        for name in ("formatter", "lint", "check", "unit_test", "integration_test"):
+            argv = cfg.get("commands", {}).get(name, [])
+            if not argv:
+                results.append({"name": name, "status": "skipped", "command": []})
+                continue
+            if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+                raise HarnessError(f"commands.{name} must be a string array")
+            executed += 1
+            log_path = p["runtime"] / f"gate-{name}.log"
+            return_code = run_logged(argv, root, log_path, int(cfg.get("gate_timeout_seconds", 900)))
+            status = "passed" if return_code == 0 else "failed"
+            results.append({"name": name, "status": status, "command": argv, "exit_code": return_code,
+                            "log": str(log_path.relative_to(root))})
+            if return_code != 0:
+                all_pass = False
+                break
+        if executed == 0:
+            all_pass = False
+        report = {"status": "passed" if all_pass else "failed", "gates": results,
+                  "completed_at": utc_now()}
+        atomic_runtime_json(p["runtime"] / REPORT_FILES["gates"], report)
+        validate_report(p["runtime"] / REPORT_FILES["gates"], skill_root() / "schemas" / "quality-gates.schema.json")
+        atomic_json(p["trusted_gates"], report)
+        state["gates_passed"] = all_pass
+        if all_pass:
+            state["validated_worktree"] = worktree_fingerprint(root)
+            save_state(p, state)
+        else:
+            transition(p, state, "CHANGES_REQUIRED", "deterministic quality gate failed")
+    emit("run-gates", "ok" if all_pass else "failed", state=load_state(p)["workflow_state"], gates=len(results))
+    if not all_pass:
+        raise HarnessError("quality gate failed; inspect the named runtime log deliberately")
+
+
+def gofmt_check(args: argparse.Namespace) -> None:
+    root = git_root(True)
+    files: list[str] = []
+    requested = args.files or sorted(
+        str(path.relative_to(root)) for path in root.rglob("*.go")
+        if ".git" not in path.parts and ".harness" not in path.parts
+    )
+    for raw in requested:
+        path = (root / raw).resolve()
+        if not path.is_relative_to(root.resolve()) or path.suffix != ".go" or not path.is_file():
+            raise HarnessError("_gofmt-check accepts only existing .go files inside the Git project")
+        files.append(str(path.relative_to(root)))
+    if not files:
+        raise HarnessError("_gofmt-check requires at least one Go file")
+    cp = run_capture(["gofmt", "-l", *files], cwd=root)
+    if cp.returncode != 0:
+        raise HarnessError("gofmt failed")
+    unformatted = [line for line in cp.stdout.splitlines() if line.strip()]
+    if unformatted:
+        raise HarnessError(f"gofmt reported {len(unformatted)} unformatted file(s)")
+
+
+def approve_slice(args: argparse.Namespace) -> None:
+    root = git_root(True)
+    p = paths(root)
+    cfg = load_config(p)
+    with state_lock(p):
+        state = load_state(p)
+        if state["workflow_state"] != "REVIEWING":
+            raise HarnessError("approve-slice requires REVIEWING")
+        if not state.get("gates_passed") or not state.get("review_passed"):
+            raise HarnessError("approval requires passing gates and approved review")
+        implementation = validate_report(p["trusted_implementation"], schema_path("implementer"))
+        gates = validate_report(p["trusted_gates"],
+                                skill_root() / "schemas" / "quality-gates.schema.json")
+        review = validate_report(p["trusted_review"], schema_path("reviewer"))
+        if implementation["status"] != "completed" or gates["status"] != "passed" or review["verdict"] != "approved":
+            raise HarnessError("structured evidence does not satisfy Slice approval")
+        require_protected_unchanged(root, cfg, state)
+        if state.get("validated_worktree") != worktree_fingerprint(root):
+            raise HarnessError("worktree changed after deterministic gates; rerun gates and review")
+        plan = ""
+        if args.next_slice:
+            if not args.plan_file:
+                raise HarnessError("--next-slice requires --plan-file with approved acceptance criteria")
+            plan = read_approved_plan(root, args.plan_file)
+        if args.complete_stage:
+            project = p["project"].read_text(encoding="utf-8")
+            marker = f"## Completed Stage {state.get('stage_id')}"
+            if marker not in project:
+                atomic_write(p["project"], project.rstrip() + f"\n\n{marker}\n\nCompleted: {utc_now()}\n")
+            record_transition(state, "APPROVED", "Hermes accepted Slice evidence")
+            record_transition(state, "STAGE_COMPLETED", "all Stage acceptance criteria satisfied")
+            save_state(p, state)
+            clear_runtime(p, preserve_lock=True)
+        elif args.next_slice:
+            state["slice_id"] = args.next_slice
+            state["attempt"] = 0
+            state["gates_passed"] = False
+            state["review_passed"] = False
+            state["worker"] = None
+            state["validated_worktree"] = None
+            body = (f"# Current Stage\n\n- Stage: {state.get('stage_id')}\n"
+                    f"- Title: {state.get('stage_title')}\n- Current Slice: {args.next_slice}\n"
+                    f"- Approved: {utc_now()}\n\n## Plan and acceptance criteria\n\n{plan}\n")
+            atomic_write(p["stage"], body)
+            atomic_write(p["trusted_stage"], body, mode=0o600)
+            state["protected_baseline"] = protected_snapshot(root, cfg)
+            record_transition(state, "APPROVED", "Hermes accepted Slice evidence")
+            record_transition(state, "SLICE_READY", "next approved Slice ready")
+            save_state(p, state)
+            clear_trusted_evidence(p)
+        else:
+            raise HarnessError("approval target is required")
+    emit("approve-slice", "ok", state=load_state(p)["workflow_state"], slice=load_state(p).get("slice_id"))
+
+
+def clear_runtime(p: dict[str, pathlib.Path], preserve_lock: bool = False) -> None:
+    del preserve_lock  # The state lock lives in trusted Git metadata, never runtime.
+    directory_fd = open_directory_nofollow(p["runtime"])
+    try:
+        clear_directory_fd(directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    with contextlib.suppress(FileNotFoundError):
+        p["trusted_checkpoint"].unlink()
+
+
+def reset_runtime(_args: argparse.Namespace) -> None:
+    root = git_root(True)
+    p = paths(root)
+    if not p["base"].is_dir():
+        raise HarnessError("project is not initialized")
+    with state_lock(p):
+        state = load_state(p)
+        if state["workflow_state"] not in {"STAGE_DISCUSSION", "STAGE_COMPLETED"}:
+            raise HarnessError("reset-runtime is allowed only between active Stages")
+        clear_runtime(p, preserve_lock=True)
+    emit("reset-runtime", "ok", preserved=["config.toml", "state.json", "PROJECT_STATE.md", "CURRENT_STAGE.md"])
+
+
+def recover(args: argparse.Namespace) -> None:
+    root = git_root(True)
+    p = paths(root, allow_unsafe_runtime=True)
+    cfg = load_config(p)
+    with state_lock(p):
+        state = load_state(p, repair_mirror=not p["base"].is_symlink())
+        runtime_safe = not p["runtime"].is_symlink()
+        checkpoint_path = (p["trusted_checkpoint"] if p["trusted_checkpoint"].exists()
+                           else p["checkpoint"] if runtime_safe else p["trusted_checkpoint"])
+        checkpoint = load_json(checkpoint_path) if checkpoint_path.exists() else None
+        worker = state.get("worker") or {}
+        active_pid = checkpoint.get("process_id") if checkpoint else worker.get("pid")
+        active_identity = (checkpoint.get("process_identity") if checkpoint
+                           else worker.get("process_identity"))
+        cgroup_value = (checkpoint.get("worker_cgroup") if checkpoint else None) or worker.get("cgroup")
+        worker_cgroup = pathlib.Path(cgroup_value) if isinstance(cgroup_value, str) and cgroup_value else None
+        if args.retry:
+            if state["workflow_state"] != "BLOCKED":
+                raise HarnessError("recover --retry requires BLOCKED")
+            if worker_cgroup is not None:
+                destroy_worker_cgroup(worker_cgroup, kill=True)
+            elif process_alive(active_pid, active_identity):
+                raise HarnessError("cannot retry while the recorded worker process is still alive")
+            target = "CHANGES_REQUIRED" if state.get("attempt", 0) else "SLICE_READY"
+            transition(p, state, target, "human authorized recovery retry")
+            emit("recover", "ok", state=target)
+            return
+        if args.ack_human:
+            if state["workflow_state"] != "HUMAN_CHECKPOINT":
+                raise HarnessError("recover --ack-human requires HUMAN_CHECKPOINT")
+            state["attempt"] = 0
+            state["gates_passed"] = False
+            state["review_passed"] = False
+            transition(p, state, "SLICE_READY", "human checkpoint acknowledged")
+            emit("recover", "ok", state="SLICE_READY")
+            return
+        if state["workflow_state"] not in {"IMPLEMENTING", "REVIEWING", "BLOCKED", "HUMAN_CHECKPOINT"}:
+            emit("recover", "noop", state=state["workflow_state"])
+            return
+        if worker_cgroup is not None:
+            destroy_worker_cgroup(worker_cgroup, kill=True)
+        elif process_alive(active_pid, active_identity):
+            emit("recover", "running", role=(checkpoint or worker).get("worker_role", worker.get("role")),
+                 pid=active_pid)
+            return
+        role = checkpoint.get("worker_role") if checkpoint else (state.get("worker") or {}).get("role")
+        output = pathlib.Path(checkpoint["expected_output_file"]) if checkpoint and checkpoint.get("expected_output_file") else None
+        if role in {"implementer", "reviewer"} and output and output.is_file():
+            try:
+                result = validate_report(output, schema_path(role))
+            except HarnessError as exc:
+                if state["workflow_state"] in {"IMPLEMENTING", "REVIEWING"}:
+                    transition(p, state, "BLOCKED", "worker stopped with an invalid structured handoff")
+                emit("recover", "blocked", state=load_state(p)["workflow_state"],
+                     error=concise(str(exc), int(cfg.get("error_excerpt_limit", 1200))))
+                return
+            if state["workflow_state"] in {"BLOCKED", "HUMAN_CHECKPOINT"}:
+                # Recovery never jumps from a terminal checkpoint. Report evidence for a human decision.
+                emit("recover", "handoff-found", state=state["workflow_state"], report=str(output.relative_to(root)))
+                return
+            if role == "implementer" and result["status"] == "completed":
+                atomic_json(p["trusted_implementation"], result)
+                transition(p, state, "VALIDATING", "recovered completed Implementer handoff")
+            elif role == "reviewer" and result["verdict"] == "approved":
+                atomic_json(p["trusted_review"], result)
+                state["review_passed"] = True
+                save_state(p, state)
+            elif role == "reviewer" and result["verdict"] == "blocked":
+                transition(p, state, "BLOCKED", "recovered Reviewer blocker")
+            else:
+                transition(p, state, "CHANGES_REQUIRED", "recovered handoff requires changes")
+            emit("recover", "ok", state=load_state(p)["workflow_state"])
+            return
+        if state["workflow_state"] in {"IMPLEMENTING", "REVIEWING"}:
+            transition(p, state, "BLOCKED", "worker stopped without a valid handoff")
+        limit = int(cfg.get("error_excerpt_limit", 1200))
+        emit("recover", "blocked", state=load_state(p)["workflow_state"], error=concise("worker stopped without valid structured output", limit))
+
+
+def parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="harness", description="Hermes + Codex staged engineering harness")
+    ap.add_argument("--version", action="version", version=f"harness {HARNESS_VERSION}")
+    sub = ap.add_subparsers(dest="command", required=True)
+    sub.add_parser("init", help="initialize lightweight .harness project state").set_defaults(func=init_project)
+    sub.add_parser("doctor", help="check Git, Python, Hermes, Codex, plugin, and compatibility").set_defaults(func=doctor)
+    sp = sub.add_parser("status", help="show concise workflow state")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=status)
+    sp = sub.add_parser("start-stage", help="record a user-approved Stage and first Slice")
+    sp.add_argument("--stage", required=True)
+    sp.add_argument("--title", required=True)
+    sp.add_argument("--slice", required=True)
+    sp.add_argument("--plan-file", required=True,
+                    help="Markdown file containing the user-approved Stage/Slice plan")
+    sp.set_defaults(func=start_stage)
+    for name, role in (("run-implementer", "implementer"), ("run-reviewer", "reviewer")):
+        sp = sub.add_parser(name, help=f"run Codex {role} with isolated output")
+        sp.add_argument("--dry-run", action="store_true")
+        sp.set_defaults(func=lambda args, r=role: run_worker(args, r))
+    sub.add_parser("run-gates", help="run configured deterministic quality gates").set_defaults(func=run_gates)
+    sp = sub.add_parser("_gofmt-check", help=argparse.SUPPRESS)
+    sp.add_argument("files", nargs="*")
+    sp.set_defaults(func=gofmt_check)
+    sp = sub.add_parser("_cgroup-exec", help=argparse.SUPPRESS)
+    sp.add_argument("cgroup")
+    sp.add_argument("argv", nargs=argparse.REMAINDER)
+    sp.set_defaults(func=cgroup_exec)
+    sp = sub.add_parser("_isolated-exec", help=argparse.SUPPRESS)
+    sp.add_argument("runtime_dir")
+    sp.add_argument("argv", nargs=argparse.REMAINDER)
+    sp.set_defaults(func=isolated_exec)
+    sp = sub.add_parser("approve-slice", help="approve after passing review and gates")
+    group = sp.add_mutually_exclusive_group(required=True)
+    group.add_argument("--next-slice")
+    group.add_argument("--complete-stage", action="store_true")
+    sp.add_argument("--plan-file", help="approved plan for --next-slice")
+    sp.set_defaults(func=approve_slice)
+    sub.add_parser("reset-runtime", help="clear only .harness/runtime contents").set_defaults(func=reset_runtime)
+    sp = sub.add_parser("recover", help="reconcile state or resume after a human decision")
+    recovery = sp.add_mutually_exclusive_group()
+    recovery.add_argument("--retry", action="store_true", help="resume a BLOCKED Slice")
+    recovery.add_argument("--ack-human", action="store_true", help="acknowledge HUMAN_CHECKPOINT and reset attempts")
+    sp.set_defaults(func=recover)
+    return ap
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        args.func(args)
+        return 0
+    except HarnessError as exc:
+        emit(args.command or "unknown", "error", error=concise(str(exc), 1200))
+        return 2
+    except KeyboardInterrupt:
+        emit(args.command or "unknown", "interrupted")
+        return 130
+    except Exception as exc:
+        emit(args.command or "unknown", "error", error=concise(f"{type(exc).__name__}: {exc}", 1200))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

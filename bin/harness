@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+HERMES_ROOT="${HERMES_HOME:-$HOME/.hermes}"
+SCRIPT="$HERMES_ROOT/skills/software-development/codex-harness/scripts/harness"
+if [ ! -f "$SCRIPT" ]; then
+  printf '%s\n' "harness: global codex-harness Skill is not installed at $SCRIPT" >&2
+  exit 127
+fi
+exec python3 "$SCRIPT" "$@"

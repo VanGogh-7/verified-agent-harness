@@ -1,0 +1,7 @@
+name: codex-harness-context
+version: "0.1.0"
+description: "Context occupancy and safe compaction fallback tools for Codex Harness orchestration."
+author: "Hermes Agent"
+provides_tools:
+  - harness_context_status
+  - harness_compact_if_needed
