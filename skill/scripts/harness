@@ -1321,7 +1321,7 @@ def doctor(args: argparse.Namespace) -> None:
     if root and paths(root)["config"].exists():
         try:
             cfg = load_config(paths(root))
-            checks["project_config"] = cfg.get("harness_version") == HARNESS_VERSION
+            checks["project_config"] = cfg.get("harness_version") in COMPATIBLE_HARNESS_VERSIONS
         except Exception:
             checks["project_config"] = False
     ok = all(v[0] if isinstance(v, tuple) else (v is not False) for v in checks.values())

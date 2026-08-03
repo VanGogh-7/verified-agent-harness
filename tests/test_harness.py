@@ -334,6 +334,31 @@ class HarnessTests(unittest.TestCase):
         finally:
             temp.cleanup()
 
+    def test_doctor_accepts_previous_compatible_harness_version(self):
+        temp, root = self.make_project()
+        try:
+            p = harness.paths(root)
+            for key in ("config", "trusted_config"):
+                config = p[key].read_text(encoding="utf-8").replace(
+                    f'harness_version = "{harness.HARNESS_VERSION}"',
+                    'harness_version = "0.2.0"')
+                harness.atomic_write(p[key], config, mode=0o600 if key == "trusted_config" else 0o644)
+            fake_checks = {name: (True, "ok") for name in ("git", "python", "hermes", "codex")}
+
+            def version(name, _args):
+                key = "python" if name == os.sys.executable else name
+                return (True, "Hermes Agent v0.19.1") if key == "hermes" else fake_checks[key]
+
+            output = io.StringIO()
+            with self.in_dir(root), contextlib.redirect_stdout(output), \
+                    mock.patch.object(harness, "executable_version", side_effect=version), \
+                    mock.patch.object(harness, "skill_root", return_value=ROOT / "skill"), \
+                    mock.patch("importlib.metadata.version", return_value="0.19.1"):
+                harness.doctor(argparse.Namespace(capabilities=False))
+            self.assertIn('"project_config":true', output.getvalue())
+        finally:
+            temp.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()
