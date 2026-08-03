@@ -6,15 +6,19 @@ if [[ -n "$(git -C "$SOURCE_ROOT" status --porcelain)" ]]; then
     printf '%s\n' 'deploy refused: source commit is not clean and frozen' >&2
     exit 2
 fi
+FROZEN_COMMIT="$(git -C "$SOURCE_ROOT" rev-parse HEAD)"
+STAGING_ROOT="$(mktemp -d -t codex-harness-deploy.XXXXXX)"
+trap 'rm -r -- "$STAGING_ROOT"' EXIT
+git -C "$SOURCE_ROOT" archive --format=tar "$FROZEN_COMMIT" | tar -xf - -C "$STAGING_ROOT"
 
 HERMES_TARGET="${HERMES_DEPLOY_HOME:-/home/van-gogh/.hermes}"
 BIN_TARGET="${HARNESS_BIN_DIR:-/home/van-gogh/.local/bin}"
 GROUP_TARGET="${GROUP_PROJECT_ROOT:-/home/van-gogh/project/Rust_code/Group}"
 install -d -m 0755 "$HERMES_TARGET/skills/software-development/codex-harness"
 install -d -m 0755 "$HERMES_TARGET/plugins/codex-harness-context" "$BIN_TARGET"
-cp -a "$SOURCE_ROOT/skill/." "$HERMES_TARGET/skills/software-development/codex-harness/"
-cp -a "$SOURCE_ROOT/plugin/." "$HERMES_TARGET/plugins/codex-harness-context/"
-install -m 0755 "$SOURCE_ROOT/bin/harness" "$BIN_TARGET/harness"
+rsync -a --delete "$STAGING_ROOT/skill/" "$HERMES_TARGET/skills/software-development/codex-harness/"
+rsync -a --delete "$STAGING_ROOT/plugin/" "$HERMES_TARGET/plugins/codex-harness-context/"
+install -m 0755 "$STAGING_ROOT/bin/harness" "$BIN_TARGET/harness"
 install -d -m 0755 "$GROUP_TARGET/.harness"
-install -m 0644 "$SOURCE_ROOT/projects/Group/config.toml" "$GROUP_TARGET/.harness/config.toml"
-printf 'deployed_commit=%s\n' "$(git -C "$SOURCE_ROOT" rev-parse HEAD)"
+install -m 0644 "$STAGING_ROOT/projects/Group/config.toml" "$GROUP_TARGET/.harness/config.toml"
+printf 'deployed_commit=%s\n' "$FROZEN_COMMIT"

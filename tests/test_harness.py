@@ -136,6 +136,10 @@ class HarnessTests(unittest.TestCase):
             "sk_live_" + "S" * 32,
             "sig=" + "Z" * 64,
             "AccountKey=" + "K" * 64,
+            '"token":"plain-secret-value"',
+            '"password": "hunter2"',
+            "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+            '"authorization":"Bearer quoted-json-secret"',
         ]
         text = "\n".join(secrets) + "\nvisible\n"
         chunks = [text[index:index + 37] for index in range(0, len(text), 37)]

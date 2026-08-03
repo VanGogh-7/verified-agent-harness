@@ -1,6 +1,6 @@
 # Trusted-local Harness hardening plan
 
-Status: Verification pending on frozen candidate
+Status: Corrections pending after independent review
 
 ## Scope
 
@@ -40,3 +40,11 @@ documentation live in this independent repository.
   child subreaper are the portable required lifecycle mechanism on this host.
 - 2026-08-03: line-buffered streaming redaction intentionally trades bounded
   memory for the rule that an unterminated possible secret suffix is never emitted.
+
+## Review findings
+
+The first fresh read-only review returned `REQUIRES FIX` for two Major findings:
+quoted JSON/Basic authorization values were not fully redacted, and deployment
+copied live ignored/stale files rather than an exact frozen Git tree. Both are
+being corrected in a new frozen commit; the superseded candidate is not approved
+for a real Stage.

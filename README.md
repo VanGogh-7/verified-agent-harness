@@ -27,7 +27,8 @@ bash -n scripts/deploy bin/harness
 git diff --check
 ```
 
-Deployment refuses a dirty source tree. Commit and freeze the exact tested
-source first, then run `scripts/deploy`. In Group, run `harness sync-config`
+Deployment refuses a dirty source tree, exports only tracked files from the
+frozen `HEAD`, and makes the skill/plugin targets exact (including stale-file
+removal). Commit and freeze the exact tested source first, then run `scripts/deploy`. In Group, run `harness sync-config`
 between Stages to explicitly import the deployed project config into the
 Git-metadata control plane.

@@ -56,6 +56,9 @@ SECRET_NAMES = re.compile(r"(?i)(api[_-]?key|token|password|secret|credential|au
 SECRET_VALUE = re.compile(
     r"(?i)(?:"
     r"bearer\s+[^\s,;]+|"
+    r"authorization\s*:\s*(?:basic|bearer)\s+[^\s,;]+|"
+    r"[\"']authorization[\"']\s*:\s*[\"'](?:basic|bearer)\s+[^\"'\r\n]+[\"']|"
+    r"[\"'](?:[A-Z0-9_]*(?:api[_-]?key|token|password|secret|credential|authorization|cookie)|database_url|accountkey|sig)[\"']\s*:\s*[\"'][^\"'\r\n]+[\"']|"
     r"(?:[A-Z0-9_]*(?:api[_-]?key|token|password|secret|credential|authorization|cookie)|database_url|accountkey|sig)\s*[:=]\s*[^\s,;]+|"
     r"(?:SharedAccessSignature\s+)?(?:sr|se|sp|sv|sig)=[^\s]+|"
     r"[a-z][a-z0-9+.-]*://[^\s:/]+:[^\s@]+@\S+|"
