@@ -1,14 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["role", "verdict", "findings", "architecture_disagreements", "gate_gaps", "protected_path_gaps"],
+  "required": ["role", "verdict", "findings", "blockers", "architecture_disagreements", "gate_gaps", "protected_path_gaps", "unresolved_risks", "language_violations", "recommendations"],
   "properties": {
     "role": {"const": "auditor"},
     "verdict": {"enum": ["PASS", "REQUIRES_CHANGES", "BLOCKED"]},
     "findings": {"type": "array", "items": {"type": "string"}},
+    "blockers": {"type": "array", "items": {"type": "string"}},
     "architecture_disagreements": {"type": "array", "items": {"type": "string"}},
     "gate_gaps": {"type": "array", "items": {"type": "string"}},
-    "protected_path_gaps": {"type": "array", "items": {"type": "string"}}
+    "protected_path_gaps": {"type": "array", "items": {"type": "string"}},
+    "unresolved_risks": {"type": "array", "items": {"type": "string"}},
+    "language_violations": {"type": "array", "items": {"type": "string"}},
+    "recommendations": {"type": "array", "items": {"type": "string"}}
   },
+  "allOf": [{"if": {"properties": {"verdict": {"const": "PASS"}}}, "then": {"properties": {"findings": {"maxItems": 0}, "blockers": {"maxItems": 0}, "architecture_disagreements": {"maxItems": 0}, "gate_gaps": {"maxItems": 0}, "protected_path_gaps": {"maxItems": 0}, "unresolved_risks": {"maxItems": 0}, "language_violations": {"maxItems": 0}}}}],
   "additionalProperties": false
 }

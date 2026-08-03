@@ -11,6 +11,21 @@ import tempfile
 import yaml
 
 
+def updated_config(config):
+    if not isinstance(config, dict):
+        raise ValueError("config root must be a mapping")
+    result = dict(config)
+    memory = dict(result.get("memory", {}))
+    skills = dict(result.get("skills", {}))
+    curator = dict(result.get("curator", {}))
+    memory.update({"memory_enabled": False, "user_profile_enabled": False,
+                   "nudge_interval": 0, "write_approval": True})
+    skills.update({"creation_nudge_interval": 0, "write_approval": True})
+    curator["enabled"] = False
+    result.update({"memory": memory, "skills": skills, "curator": curator})
+    return result
+
+
 def main() -> int:
     root = Path(os.environ.get("HERMES_DEPLOY_HOME", "/home/van-gogh/.hermes"))
     config_path = root / "config.yaml"
@@ -18,8 +33,10 @@ def main() -> int:
         raise SystemExit("configure-hermes refused: config.yaml is missing or symlinked")
     raw = config_path.read_text(encoding="utf-8")
     config = yaml.safe_load(raw) or {}
-    if not isinstance(config, dict):
-        raise SystemExit("configure-hermes refused: config root must be a mapping")
+    try:
+        configured = updated_config(config)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"configure-hermes refused: {exc}") from exc
 
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup = config_path.with_name(f"config.yaml.bak.lifecycle-{stamp}")
@@ -28,18 +45,7 @@ def main() -> int:
     shutil.copy2(config_path, backup, follow_symlinks=False)
     os.chmod(backup, 0o600)
 
-    memory = config.setdefault("memory", {})
-    skills = config.setdefault("skills", {})
-    curator = config.setdefault("curator", {})
-    for label, value in (("memory", memory), ("skills", skills), ("curator", curator)):
-        if not isinstance(value, dict):
-            raise SystemExit(f"configure-hermes refused: {label} must be a mapping")
-    memory.update({"memory_enabled": False, "user_profile_enabled": False,
-                   "nudge_interval": 0, "write_approval": True})
-    skills.update({"creation_nudge_interval": 0, "write_approval": True})
-    curator["enabled"] = False
-
-    rendered = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
+    rendered = yaml.safe_dump(configured, sort_keys=False, allow_unicode=True)
     fd, name = tempfile.mkstemp(prefix=".config.yaml.", dir=root)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:

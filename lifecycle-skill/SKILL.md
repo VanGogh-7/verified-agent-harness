@@ -1,7 +1,7 @@
 ---
 name: project-lifecycle-harness
 description: Use when routing a project through greenfield bootstrap, brownfield Harness adoption, compatible Harness operation, or explicit Harness migration.
-version: 0.3.0
+version: 0.5.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -37,9 +37,9 @@ Run `harness detect --json`. Detection is read-only.
 1. Discuss the problem and target users, core use cases, MVP/non-goals, technical constraints, security/data boundaries, deployment, external services/tools, and acceptance criteria. Ask only the next architecture-relevant questions.
 2. Write an English `PROJECT_BRIEF.md` draft from `templates/PROJECT_BRIEF.md` outside the target if the directory must remain pristine.
 3. Obtain one explicit operator approval for the complete brief. Do not reinterpret a non-English approval.
-4. Run `harness bootstrap --brief <path> --approved`. This creates Git, standard English project docs, and the Harness; it does not mark readiness.
+4. Run `harness bootstrap --brief <path> --dry-run`, review every `CREATE`, `MODIFY`, `PRESERVE`, and `REJECT` entry, obtain approval, then run `harness bootstrap --brief <path> --approved --approved-plan-hash <sha256>`. This creates Git, standard English project docs, and the Harness; it does not mark readiness.
 5. Define an English baseline Stage for the initial scaffold. Use `harness start-stage`, `run-implementer`, baseline gates, `run-reviewer`, and `approve-slice --complete-stage` exactly as required by `codex-harness`. Implementer is workspace-write; Reviewer is independent and read-only.
-6. Run a separate final read-only lifecycle review returning the contract in `schemas/final-review.schema.json`, then `harness activate --final-review <path>`.
+6. Run a separate final read-only lifecycle review returning the contract in `schemas/final-review.schema.json`, then `harness activate --final-review <path>`. If activation is interrupted after evidence persistence, use `harness activate --resume`; do not reread or replace the approved final report.
 
 ## BROWNFIELD_ADOPTION
 
@@ -47,7 +47,7 @@ Run `harness detect --json`. Detection is read-only.
 2. Codex A is Architecture Analyst using `templates/analyst-prompt.md` and `schemas/analyst.schema.json`, read-only. Codex B is an independent Auditor using `templates/auditor-prompt.md` and `schemas/auditor.schema.json`, read-only. Never ask Hermes to review its own Skill.
 3. Validate both reports with `harness assess --analyst-report <path> --auditor-report <path> --json`. Missing or malformed reports stop adoption.
 4. Synthesize an English `HARNESS_ADOPTION_REPORT.md` from `templates/HARNESS_ADOPTION_REPORT.md`. Ask the operator to approve detected architecture, protected paths, quality gates, context files, and adoption constraints.
-5. Only after approval run `harness adopt --report <path> --analyst-report <path> --auditor-report <path> --approved`.
+5. Run `harness adopt --report <path> --analyst-report <path> --auditor-report <path> --dry-run`. Review the canonical mutation manifest and copy the exact generated approval block, including derived argv arrays, into the report. Only after approval run the same command with `--approved --approved-plan-hash <sha256>`. If interrupted, run `harness adopt --resume`; use `harness adopt --rollback` for CAS-protected restoration; never inject lifecycle state manually.
 6. Use a narrowly scoped baseline Stage through `codex-harness` for configuration/state validation only. Run baseline gates and an independent read-only Reviewer, complete the Stage, then run the final lifecycle review and `harness activate`.
 
 During adoption never refactor business code, fix unrelated defects, upgrade dependencies, change public APIs, format the repository, or add product features. `harness assess` and `harness adopt --dry-run` are read-only with respect to business code.

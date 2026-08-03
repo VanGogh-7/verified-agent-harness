@@ -359,6 +359,47 @@ class HarnessTests(unittest.TestCase):
         finally:
             temp.cleanup()
 
+    def test_complete_compatible_020_stage_slice_workflow(self):
+        temp, root = self.make_project()
+        try:
+            p = harness.paths(root)
+            config = p["config"].read_text(encoding="utf-8")
+            config = config.replace(f'harness_version = "{harness.HARNESS_VERSION}"',
+                                    'harness_version = "0.2.0"')
+            config = config.replace("stage = []", 'stage = [["git", "diff", "--check"]]')
+            harness.atomic_write(p["config"], config)
+            plan = root / "baseline-plan.md"
+            plan.write_text(
+                "# Baseline Validation\n\nVerify the complete compatible Stage and Slice workflow without product changes.\n",
+                encoding="utf-8")
+            fake = root / "fake-codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "schema = pathlib.Path(sys.argv[sys.argv.index('--output-schema') + 1]).name\n"
+                "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+                "if schema == 'implementation.schema.json':\n"
+                "    value = {'status':'completed','summary':'No product changes required.',"
+                "'changed_files':[],'tests':['fixture'],'blockers':[]}\n"
+                "else:\n"
+                "    value = {'verdict':'approved','summary':'Baseline is valid.',"
+                "'findings':[],'checks_reviewed':['stage gate']}\n"
+                "output.write_text(json.dumps(value), encoding='utf-8')\n",
+                encoding="utf-8")
+            fake.chmod(0o755)
+            with self.in_dir(root), contextlib.redirect_stdout(io.StringIO()):
+                harness.start_stage(argparse.Namespace(stage="S1", title="Compatibility Baseline",
+                                                       slice="S1.1", plan_file=str(plan)))
+            env = {**os.environ, "HARNESS_CODEX_BIN": str(fake)}
+            for argv in (("run-implementer",), ("run-gates", "--level", "stage"),
+                         ("run-reviewer",), ("approve-slice", "--complete-stage")):
+                result = subprocess.run([sys.executable, str(SCRIPT), *argv], cwd=root, env=env,
+                                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(harness.load_state(p)["workflow_state"], "STAGE_COMPLETED")
+        finally:
+            temp.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

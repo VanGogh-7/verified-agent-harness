@@ -1,5 +1,5 @@
 config_version = 1
-harness_version = "0.2.0"
+harness_version = "0.5.0"
 project_name = "example"
 project_type = "generic"
 context_files = []
@@ -38,6 +38,8 @@ agent_instruction_language = "en"
 agent_report_language = "en"
 operator_language = "auto"
 correct_operator_grammar = false
+strict_engineering_language = true
+product_localization_paths = []
 
 [context_maintenance]
 enabled = true

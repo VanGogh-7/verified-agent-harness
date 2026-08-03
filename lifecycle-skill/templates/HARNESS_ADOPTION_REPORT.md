@@ -8,6 +8,9 @@
 
 ## Quality gates
 
+The exact executable argv arrays are inserted by `harness adopt --dry-run` in
+the approval manifest below. Do not edit them manually.
+
 ## Project context files
 
 ## Adoption constraints
@@ -19,3 +22,7 @@
 ## Operator approval
 
 Status: Pending
+
+<!-- harness-adoption-approval:start -->
+<APPROVAL_MANIFEST>
+<!-- harness-adoption-approval:end -->
