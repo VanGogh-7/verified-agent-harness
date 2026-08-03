@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["role", "verdict", "findings"],
+  "properties": {
+    "role": {"const": "final_reviewer"},
+    "verdict": {"enum": ["PASS", "REQUIRES_CHANGES", "BLOCKED"]},
+    "findings": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}

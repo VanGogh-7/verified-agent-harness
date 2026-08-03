@@ -14,6 +14,9 @@ Protected paths (do not modify unless the approved Slice explicitly authorizes i
 {{PROTECTED_PATHS}}
 
 Rules:
+- Use English for this prompt response, the handoff report, engineering documentation, source-code comments, identifiers, file names, tests, configuration keys, Stage/Slice titles, and commit messages.
+- Product-facing localized strings may use approved locales; keep localization keys and engineering identifiers in English.
+- Preserve paths, commands, identifiers, API names, Stage/Slice IDs, state values, Git references, package names, JSON keys, and error codes exactly; do not translate or rename them.
 - Inspect relevant definitions and usages before editing.
 - Preserve unrelated user changes and do not commit, push, tag, publish, or rewrite history.
 - Use the smallest correct change and add direct tests for behavior changes.

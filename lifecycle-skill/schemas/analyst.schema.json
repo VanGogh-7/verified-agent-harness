@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["role", "architecture", "protected_paths", "quality_gates", "context_files", "adoption_constraints", "risks"],
+  "properties": {
+    "role": {"const": "analyst"},
+    "architecture": {"type": "string"},
+    "protected_paths": {"type": "array", "items": {"type": "string"}},
+    "quality_gates": {"type": "array", "items": {"type": "array", "items": {"type": "string"}, "minItems": 1}},
+    "context_files": {"type": "array", "items": {"type": "string"}},
+    "adoption_constraints": {"type": "array", "items": {"type": "string"}},
+    "risks": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}

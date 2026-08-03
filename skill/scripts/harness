@@ -27,8 +27,10 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
-HARNESS_VERSION = "0.2.0"
+HARNESS_VERSION = "0.3.0"
 CONFIG_VERSION = 1
+LIFECYCLE_VERSION = 1
+COMPATIBLE_HARNESS_VERSIONS = {"0.2.0", HARNESS_VERSION}
 STATES = {
     "STAGE_DISCUSSION", "STAGE_APPROVED", "SLICE_READY", "IMPLEMENTING",
     "VALIDATING", "REVIEWING", "CHANGES_REQUIRED", "APPROVED", "BLOCKED",
@@ -629,6 +631,15 @@ def load_config(p: dict[str, pathlib.Path]) -> dict[str, Any]:
         raise HarnessError("[codex].reviewer_sandbox must be exactly 'read-only'")
     if codex.get("ephemeral") is not True:
         raise HarnessError("[codex].ephemeral must be true")
+    if cfg.get("harness_version") == HARNESS_VERSION:
+        language = cfg.get("language", {})
+        required_language = {
+            "internal_language": "en", "repository_language": "en",
+            "agent_instruction_language": "en", "agent_report_language": "en",
+            "operator_language": "auto", "correct_operator_grammar": False,
+        }
+        if any(language.get(key) != value for key, value in required_language.items()):
+            raise HarnessError("[language] must preserve the canonical English boundary")
     return cfg
 
 
@@ -731,9 +742,287 @@ def toml_commands(commands: Iterable[Iterable[str]]) -> str:
     return "[" + ", ".join(toml_array(command) for command in commands) + "]"
 
 
+def detect_operator_language(text: str, requested: str = "auto") -> str:
+    """Resolve a conversation-scoped display language without persisting it."""
+    if requested in {"en", "zh"}:
+        return requested
+    return "zh" if re.search(r"[\u3400-\u9fff]", text or "") else "en"
+
+
+def operator_message(key: str, language: str) -> str:
+    messages = {
+        "approval_required": {
+            "en": "Explicit operator approval is required before files are changed.",
+            "zh": "更改文件前需要操作员明确批准。",
+        },
+        "assessment_ready": {
+            "en": "The read-only assessment is ready for operator review.",
+            "zh": "只读评估已完成，等待操作员审阅。",
+        },
+        "harness_ready": {
+            "en": "The project is HARNESS_READY.",
+            "zh": "项目已进入 HARNESS_READY。",
+        },
+    }
+    return messages[key][language]
+
+
+def directory_entries(root: pathlib.Path) -> list[pathlib.Path]:
+    ignored = {".DS_Store"}
+    return [entry for entry in root.iterdir() if entry.name not in ignored]
+
+
+def inspect_harness(root: pathlib.Path) -> tuple[str, str | None]:
+    base = root / ".harness"
+    required = {"config.toml", "state.json", "PROJECT_STATE.md", "CURRENT_STAGE.md"}
+    if not base.exists():
+        return "ABSENT", None
+    if not base.is_dir() or base.is_symlink():
+        return "DAMAGED_HARNESS", "invalid_harness_directory"
+    present = {name for name in required if (base / name).is_file()}
+    if present != required:
+        return "DAMAGED_HARNESS", "missing_required_harness_files"
+    try:
+        if tomllib is None:
+            raise ValueError("tomllib unavailable")
+        with (base / "config.toml").open("rb") as handle:
+            cfg = tomllib.load(handle)
+        state = json.loads((base / "state.json").read_text(encoding="utf-8"))
+    except Exception:
+        return "DAMAGED_HARNESS", "malformed_harness_control_file"
+    if cfg.get("config_version") != CONFIG_VERSION:
+        return "INCOMPATIBLE_HARNESS", "unsupported_config_version"
+    if cfg.get("harness_version") not in COMPATIBLE_HARNESS_VERSIONS:
+        return "INCOMPATIBLE_HARNESS", "unsupported_harness_version"
+    if state.get("workflow_state") not in STATES:
+        return "DAMAGED_HARNESS", "unknown_workflow_state"
+    return "COMPATIBLE_HARNESS", None
+
+
+def lifecycle_detection(root: pathlib.Path) -> dict[str, Any]:
+    git = run_capture(["git", "rev-parse", "--show-toplevel"], cwd=root)
+    is_git = git.returncode == 0
+    project_root = pathlib.Path(git.stdout.strip()).resolve() if is_git else root.resolve()
+    dirty = False
+    if is_git:
+        status_result = run_capture(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=project_root)
+        dirty = bool(status_result.stdout.strip()) if status_result.returncode == 0 else True
+    harness_kind, reason = inspect_harness(project_root)
+    if harness_kind == "COMPATIBLE_HARNESS":
+        classification, mode = harness_kind, "HARNESS_OPERATION"
+    elif harness_kind in {"DAMAGED_HARNESS", "INCOMPATIBLE_HARNESS"}:
+        classification, mode = harness_kind, "HARNESS_OPERATION"
+    elif is_git:
+        classification, mode = "GIT_WITHOUT_HARNESS", "BROWNFIELD_ADOPTION"
+    elif not directory_entries(root):
+        classification, mode = "EMPTY_DIRECTORY", "GREENFIELD_BOOTSTRAP"
+    else:
+        classification, mode = "NEW_DIRECTORY", "GREENFIELD_BOOTSTRAP"
+    result = {"mode": mode, "classification": classification, "dirty_worktree": dirty,
+              "git_repository": is_git, "project_root": str(project_root), "reason": reason}
+    lifecycle_path = project_root / ".harness" / "lifecycle.json"
+    if harness_kind == "COMPATIBLE_HARNESS" and lifecycle_path.is_file():
+        try:
+            lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+            result["lifecycle_state"] = lifecycle.get("lifecycle_state")
+        except Exception:
+            result["classification"] = "DAMAGED_HARNESS"
+            result["reason"] = "malformed_lifecycle_state"
+    return result
+
+
+def detect_lifecycle(args: argparse.Namespace) -> None:
+    root = pathlib.Path.cwd().resolve()
+    result = lifecycle_detection(root)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        emit("detect", "ok", **result)
+
+
+def ensure_english_artifact(path: pathlib.Path, label: str) -> str:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise HarnessError(f"missing {label}: {path}") from exc
+    if not text.strip():
+        raise HarnessError(f"{label} is empty")
+    # Engineering artifacts may contain required localized product strings, but
+    # headings and machine-facing structure must be English. This gate catches
+    # wholly non-English reports without renaming paths or identifiers.
+    ascii_letters = len(re.findall(r"[A-Za-z]", text))
+    if ascii_letters < 20:
+        raise HarnessError(f"{label} must be an English engineering artifact")
+    return text
+
+
+def lifecycle_report(path: pathlib.Path, role: str) -> dict[str, Any]:
+    value = load_json(path)
+    schema_name = {"analyst": "analyst.schema.json", "auditor": "auditor.schema.json",
+                   "final_reviewer": "final-review.schema.json"}[role]
+    schema_file = pathlib.Path(__file__).resolve().parents[2] / "lifecycle-skill" / "schemas" / schema_name
+    try:
+        schema = json.loads(schema_file.read_text(encoding="utf-8"))
+        validate_schema_value(value, schema)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise HarnessError(f"invalid lifecycle report schema: {schema_name}") from exc
+    if value.get("role") != role:
+        raise HarnessError(f"malformed {role} report role")
+    return value
+
+
+def validate_project_relative_path(value: str, label: str, allow_glob: bool = False) -> str:
+    path = pathlib.PurePosixPath(value)
+    if (not value or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts)
+            or "\\" in value):
+        raise HarnessError(f"{label} must be a normalized project-relative path: {value!r}")
+    if not allow_glob and any(character in value for character in "*?["):
+        raise HarnessError(f"{label} must not contain a glob: {value!r}")
+    return value
+
+
+def assess_project(args: argparse.Namespace) -> None:
+    root = pathlib.Path.cwd().resolve()
+    detection = lifecycle_detection(root)
+    if detection["classification"] != "GIT_WITHOUT_HARNESS":
+        raise HarnessError("assess requires a Git repository without a Harness")
+    facts = detect_project(root)
+    reports: dict[str, Any] = {}
+    if args.analyst_report or args.auditor_report:
+        if not args.analyst_report or not args.auditor_report:
+            raise HarnessError("both analyst and auditor reports are required")
+        reports["analyst"] = lifecycle_report(pathlib.Path(args.analyst_report), "analyst")
+        reports["auditor"] = lifecycle_report(pathlib.Path(args.auditor_report), "auditor")
+    result = {"mode": "BROWNFIELD_ADOPTION", "read_only": True,
+              "dirty_worktree": detection["dirty_worktree"], "project": facts,
+              "reports": reports}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        language = detect_operator_language(args.operator_input, args.operator_language)
+        emit("assess", "ok", mode=result["mode"], read_only=True,
+             dirty_worktree=result["dirty_worktree"],
+             operator_message=operator_message("assessment_ready", language))
+
+
+def render_project_doc(title: str, body: str) -> str:
+    return f"# {title}\n\n{body.strip()}\n"
+
+
+def write_lifecycle_state(root: pathlib.Path, workflow: str, source: str) -> None:
+    p = paths(root)
+    value = {"lifecycle_version": LIFECYCLE_VERSION, "lifecycle_state": workflow,
+             "source": source, "updated_at": utc_now()}
+    atomic_json(p["trusted"] / "lifecycle.json", value)
+    atomic_runtime_json(p["base"] / "lifecycle.json", value)
+
+
+def bootstrap_project(args: argparse.Namespace) -> None:
+    root = pathlib.Path.cwd().resolve()
+    detection = lifecycle_detection(root)
+    if detection["mode"] != "GREENFIELD_BOOTSTRAP":
+        raise HarnessError("bootstrap requires an empty or new non-Harness directory")
+    brief_path = pathlib.Path(args.brief).resolve()
+    brief = ensure_english_artifact(brief_path, "PROJECT_BRIEF")
+    if not args.approved:
+        language = detect_operator_language(args.operator_input, args.operator_language)
+        raise HarnessError(operator_message("approval_required", language))
+    if args.dry_run:
+        emit("bootstrap", "dry-run", would_create=[".git", "PROJECT_BRIEF.md", "README.md",
+                                                   "AGENTS.md", "ARCHITECTURE.md", ".harness/"])
+        return
+    if not (root / ".git").exists():
+        cp = run_capture(["git", "init", "-b", "main"], cwd=root)
+        if cp.returncode != 0:
+            raise HarnessError(f"git init failed: {concise(cp.stdout, 400)}")
+    atomic_write(root / "PROJECT_BRIEF.md", brief.rstrip() + "\n")
+    defaults = {
+        "README.md": render_project_doc(root.name, "See `PROJECT_BRIEF.md` for the approved product definition."),
+        "AGENTS.md": render_project_doc("Engineering Instructions", "Use English for engineering artifacts, code comments, identifiers, plans, reports, and commits. Preserve approved scope and protected paths."),
+        "ARCHITECTURE.md": render_project_doc("Architecture", "Architecture is pending the approved initial scaffold."),
+    }
+    for name, content in defaults.items():
+        if not (root / name).exists():
+            atomic_write(root / name, content)
+    init_project(argparse.Namespace())
+    write_lifecycle_state(root, "SCAFFOLD_PENDING", "GREENFIELD_BOOTSTRAP")
+    emit("bootstrap", "ok", lifecycle_state="SCAFFOLD_PENDING")
+
+
+def adopt_project(args: argparse.Namespace) -> None:
+    root = pathlib.Path.cwd().resolve()
+    detection = lifecycle_detection(root)
+    if detection["classification"] != "GIT_WITHOUT_HARNESS":
+        raise HarnessError("adopt requires a Git repository without a Harness")
+    ensure_english_artifact(pathlib.Path(args.report), "HARNESS_ADOPTION_REPORT")
+    analyst = lifecycle_report(pathlib.Path(args.analyst_report), "analyst")
+    auditor = lifecycle_report(pathlib.Path(args.auditor_report), "auditor")
+    if auditor.get("verdict") != "PASS":
+        raise HarnessError("independent Auditor must pass before adoption")
+    for value in analyst["context_files"]:
+        validate_project_relative_path(value, "context file")
+        if pathlib.PurePosixPath(value).name.startswith(".env") or SECRET_NAMES.search(value):
+            raise HarnessError("context files must not include credential-shaped paths")
+    for value in analyst["protected_paths"]:
+        validate_project_relative_path(value, "protected path", allow_glob=True)
+    if not args.approved:
+        language = detect_operator_language(args.operator_input, args.operator_language)
+        raise HarnessError(operator_message("approval_required", language))
+    if args.dry_run:
+        emit("adopt", "dry-run", business_code_modified=False,
+             would_create=["HARNESS_ADOPTION_REPORT.md", ".harness/"])
+        return
+    report = pathlib.Path(args.report).read_text(encoding="utf-8")
+    atomic_write(root / "HARNESS_ADOPTION_REPORT.md", report.rstrip() + "\n")
+    init_project(argparse.Namespace())
+    facts = detect_project(root)
+    facts["context"] = list(analyst["context_files"])
+    facts["approved_quality_gates"] = list(analyst["quality_gates"])
+    facts["approved_protected_paths"] = list(analyst["protected_paths"])
+    p = paths(root)
+    approved_config = render_config(root, facts)
+    atomic_write(p["config"], approved_config)
+    atomic_write(p["trusted_config"], approved_config, mode=0o600)
+    write_lifecycle_state(root, "ADOPTION_BASELINE_PENDING", "BROWNFIELD_ADOPTION")
+    lifecycle = load_json(p["trusted"] / "lifecycle.json")
+    lifecycle.update({"adoption_report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+                      "protected_paths": analyst["protected_paths"],
+                      "quality_gates": analyst["quality_gates"],
+                      "context_files": analyst["context_files"],
+                      "adoption_constraints": analyst["adoption_constraints"]})
+    atomic_json(p["trusted"] / "lifecycle.json", lifecycle)
+    atomic_runtime_json(p["base"] / "lifecycle.json", lifecycle)
+    emit("adopt", "ok", lifecycle_state="ADOPTION_BASELINE_PENDING")
+
+
+def activate_project(args: argparse.Namespace) -> None:
+    root = git_root()
+    p = paths(root)
+    lifecycle_path = p["trusted"] / "lifecycle.json"
+    lifecycle = load_json(lifecycle_path)
+    if lifecycle.get("lifecycle_state") not in {"SCAFFOLD_PENDING", "ADOPTION_BASELINE_PENDING",
+                                                 "ACTIVATION_INTERRUPTED"}:
+        raise HarnessError("project is not awaiting lifecycle activation")
+    final = lifecycle_report(pathlib.Path(args.final_review), "final_reviewer")
+    if final.get("verdict") != "PASS":
+        raise HarnessError("final read-only lifecycle review did not pass")
+    state = load_state(p)
+    if state.get("workflow_state") != "STAGE_COMPLETED":
+        raise HarnessError("baseline Stage must complete through the existing Stage/Slice engine")
+    lifecycle["lifecycle_state"] = "HARNESS_READY"
+    lifecycle["updated_at"] = utc_now()
+    atomic_json(lifecycle_path, lifecycle)
+    atomic_runtime_json(p["base"] / "lifecycle.json", lifecycle)
+    language = detect_operator_language(args.operator_input, args.operator_language)
+    emit("activate", "ok", lifecycle_state="HARNESS_READY",
+         operator_message=operator_message("harness_ready", language))
+
+
 def detect_project(root: pathlib.Path) -> dict[str, Any]:
     context_candidates = [
         "AGENTS.md", "CLAUDE.md", ".cursorrules", "ARCHITECTURE.md", "README.md",
+        "PROJECT_BRIEF.md", "HARNESS_ADOPTION_REPORT.md",
         "README.rst", "README.txt", "docs/quality.md", "docs/exec-plans/README.md",
     ]
     context = [name for name in context_candidates if (root / name).is_file()]
@@ -816,7 +1105,10 @@ def render_config(root: pathlib.Path, facts: dict[str, Any]) -> str:
     commands = facts["commands"]
     is_rust = str(facts["project_type"]).startswith("rust")
     fast_gates = [["harness", "_rust-affected-check"]] if is_rust else []
-    if is_rust and "scripts/verify" in facts["build_entrypoints"]:
+    if "approved_quality_gates" in facts:
+        slice_gates = [list(command) for command in facts["approved_quality_gates"]]
+        stage_gates = list(slice_gates)
+    elif is_rust and "scripts/verify" in facts["build_entrypoints"]:
         slice_gates = [["./scripts/verify", "fast"],
                        ["cargo", "test", "--locked", "--workspace"]]
         stage_gates = [["./scripts/verify", "full"]]
@@ -825,7 +1117,10 @@ def render_config(root: pathlib.Path, facts: dict[str, Any]) -> str:
         stage_gates = list(slice_gates)
     protected = [".git/", ".env", ".env.*", ".harness/config.toml",
                  ".harness/state.json", ".harness/runtime/",
-                 "AGENTS.md", "ARCHITECTURE.md"]
+                 "AGENTS.md", "ARCHITECTURE.md", "PROJECT_BRIEF.md",
+                 "HARNESS_ADOPTION_REPORT.md"]
+    protected.extend(path for path in facts.get("approved_protected_paths", [])
+                     if path not in protected)
     return f'''config_version = {CONFIG_VERSION}
 harness_version = {q(HARNESS_VERSION)}
 project_name = {q(root.name)}
@@ -858,6 +1153,14 @@ command = ["codex"]
 implementer_sandbox = "workspace-write"
 reviewer_sandbox = "read-only"
 ephemeral = true
+
+[language]
+internal_language = "en"
+repository_language = "en"
+agent_instruction_language = "en"
+agent_report_language = "en"
+operator_language = "auto"
+correct_operator_grammar = false
 
 [context_maintenance]
 enabled = true
@@ -1071,8 +1374,12 @@ def sync_config(_args: argparse.Namespace) -> None:
 
 def start_stage(args: argparse.Namespace) -> None:
     root = git_root(True)
+    if not re.search(r"[A-Za-z]", args.title):
+        raise HarnessError("Stage title must be English")
     p = paths(root)
     plan = read_approved_plan(root, args.plan_file)
+    if len(re.findall(r"[A-Za-z]", plan)) < 20:
+        raise HarnessError("the approved Stage plan must be an English engineering artifact")
     with state_lock(p):
         state = load_state(p)
         if state["workflow_state"] not in {"STAGE_DISCUSSION", "STAGE_COMPLETED"}:
@@ -1907,6 +2214,37 @@ def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="harness", description="Hermes + Codex staged engineering harness")
     ap.add_argument("--version", action="version", version=f"harness {HARNESS_VERSION}")
     sub = ap.add_subparsers(dest="command", required=True)
+    sp = sub.add_parser("detect", help="read-only project lifecycle detection")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=detect_lifecycle)
+    sp = sub.add_parser("assess", help="read-only brownfield architecture assessment")
+    sp.add_argument("--analyst-report")
+    sp.add_argument("--auditor-report")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--operator-language", choices=("auto", "en", "zh"), default="auto")
+    sp.add_argument("--operator-input", default="")
+    sp.set_defaults(func=assess_project)
+    sp = sub.add_parser("bootstrap", help="initialize an approved greenfield project")
+    sp.add_argument("--brief", required=True)
+    sp.add_argument("--approved", action="store_true")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--operator-language", choices=("auto", "en", "zh"), default="auto")
+    sp.add_argument("--operator-input", default="")
+    sp.set_defaults(func=bootstrap_project)
+    sp = sub.add_parser("adopt", help="initialize an approved brownfield Harness")
+    sp.add_argument("--report", required=True)
+    sp.add_argument("--analyst-report", required=True)
+    sp.add_argument("--auditor-report", required=True)
+    sp.add_argument("--approved", action="store_true")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--operator-language", choices=("auto", "en", "zh"), default="auto")
+    sp.add_argument("--operator-input", default="")
+    sp.set_defaults(func=adopt_project)
+    sp = sub.add_parser("activate", help="mark a baseline-reviewed project HARNESS_READY")
+    sp.add_argument("--final-review", required=True)
+    sp.add_argument("--operator-language", choices=("auto", "en", "zh"), default="auto")
+    sp.add_argument("--operator-input", default="")
+    sp.set_defaults(func=activate_project)
     sub.add_parser("init", help="initialize lightweight .harness project state").set_defaults(func=init_project)
     sp = sub.add_parser("doctor", help="read-only dependency checks; capability probes are opt-in")
     sp.add_argument("--capabilities", action="store_true",

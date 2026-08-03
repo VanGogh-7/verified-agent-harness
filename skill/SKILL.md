@@ -1,7 +1,7 @@
 ---
 name: codex-harness
 description: Use when orchestrating staged Hermes + Codex engineering.
-version: 0.2.0
+version: 0.3.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -19,6 +19,8 @@ Act as Lead Engineer and Orchestrator. Codex A implements with `workspace-write`
 
 ## Mandatory protocol
 
+The sibling global Skill `project-lifecycle-harness` owns greenfield bootstrap, brownfield adoption, compatibility migration, and the transition to `HARNESS_READY`. Use this Skill's Stage/Slice engine only for a compatible Harness after lifecycle routing, or for the lifecycle Skill's explicitly approved baseline Stage.
+
 1. Discuss direction, architecture, Stages, Slices, acceptance criteria, and hard exclusions with the user. Do not launch Codex before explicit approval.
 2. Run `harness init` once. Before every action, read only `.harness/state.json` (or `harness status`) and the relevant current-state document.
 3. Record approval with `harness start-stage --stage ... --title ... --slice ... --plan-file ...`. The command validates transitions and updates `CURRENT_STAGE.md`.
@@ -28,6 +30,12 @@ Act as Lead Engineer and Orchestrator. Codex A implements with `workspace-write`
 7. After Implementer handoff, run `harness run-gates --level fast|slice|stage` as required. Launch Reviewer only after gates pass. Approve a Slice only when both `quality-gates.json` and `review.json` pass.
 8. Limit each Slice to three A/B correction attempts (or the lower configured cap). On exhaustion, stop at `HUMAN_CHECKPOINT`.
 9. At Stage completion, update `PROJECT_STATE.md`, run `harness approve-slice --complete-stage`, and let the CLI clear replaceable runtime files. Commit only when the project/user policy authorizes it.
+
+## Language boundary
+
+Detect the operator's language from the active conversation and use it only for operator-facing discussion, progress, approval, checkpoint, and completion messages. Never persist that detected language as a project or user preference, never proactively correct the operator's grammar, and reassess it in each new conversation.
+
+All Agent-to-Agent prompts and reports, machine state, schemas, gate reports, engineering documentation, plans, source comments, paths, names, identifiers, tests, configuration, Stage/Slice titles, Git messages, CI names, and templates are English. Convert approved non-English requirements into precise English artifacts without changing their meaning. Do not translate or rename paths, commands, code/API identifiers, Stage/Slice IDs, state values, Git references, package names, JSON keys, or error codes. Product localization is separate: localized product strings may use required locales, while localization keys and engineering artifacts remain English.
 
 This release is deliberately **trusted-local**, not a hostile-repository sandbox.
 Project code, worker commands, and quality gates still execute as the current Unix
