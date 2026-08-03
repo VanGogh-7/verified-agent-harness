@@ -20,16 +20,12 @@ there; `.harness/` contains project-facing mirrors and runtime handoffs. Codex
 gate commands, Reviewer isolation, or approval state. Configuration changes
 are imported only by `start-stage` from a between-Stage state.
 
-Before launching a worker, the Linux CLI creates and durably records a dedicated
-cgroup v2, enters it before executing Codex, enables `PR_SET_CHILD_SUBREAPER`,
-and starts a new process group. Before Codex starts, private user, mount, cgroup,
-and PID namespaces cover `/sys/fs/cgroup`, `/proc`, and the user runtime directory;
-all capabilities are dropped with no-new-privileges. The worker therefore cannot
-migrate itself through delegated cgroup files or the user systemd socket. Harness
-empties the cgroup with `cgroup.kill` and drains adopted descendants before
-validating the handoff. Because the cgroup outlives the CLI, `recover` can kill
-the complete containment after an orchestrator crash; recovery never accepts a
-handoff first.
+Before launching a worker, the Linux CLI enables `PR_SET_CHILD_SUBREAPER`, starts
+a new process group, and uses a dedicated cgroup v2 when the host delegates one.
+The cgroup is optional; user namespaces and `unshare` are not required. Harness
+drains descendants before validating a handoff. This is lifecycle hygiene for a
+trusted local repository, not a security boundary: project code still runs as the
+current Unix user and can access anything that user can access.
 
 Review generated command arrays. They execute directly without a shell. For projects with bespoke entrypoints, edit only command arrays and project facts; never put pipelines, redirections, interpolation, or secret values in them.
 
@@ -52,7 +48,7 @@ harness run-implementer
 The Harness increments attempt, writes prompt/command/checkpoint atomically, starts Codex with `workspace-write`, `--ephemeral`, `--output-schema`, and `--output-last-message`, and streams combined stdout/stderr through credential-shaped redaction to the mode-0600 `.harness/runtime/implementer.log`. Its terminal output is one concise status line.
 
 5. On completion, inspect `implementation.json` and concise Git evidence; do not inspect the full log unless the handoff is missing or a bounded error requires deliberate diagnosis.
-6. Run `harness run-gates`. Each configured array is executed without a shell and gets a separate runtime log. At least one substantive gate must run; an all-skipped configuration fails closed for manual project configuration. The compact result is `quality-gates.json`.
+6. Run `harness run-gates --level fast`, `--level slice`, or `--level stage`. Fast is affected-crate feedback only and cannot unlock review. Slice unlocks Reviewer and next-Slice approval. Stage is required before final Stage review/approval. Each configured command array is executed without a shell under a temporary HOME and credential/proxy-free allowlisted environment, with a separate runtime log. At least one substantive gate must run; an empty tier fails closed. The compact result is `quality-gates.json`.
 7. Start `harness run-reviewer` in the background. Reviewer uses `read-only`, ephemeral mode, a review schema, and a separate log.
 8. Read `review.json`. If changes are required, the state returns to `CHANGES_REQUIRED`; launch A again. Otherwise:
 

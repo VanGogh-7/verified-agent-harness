@@ -1,7 +1,7 @@
 ---
 name: codex-harness
 description: Use when orchestrating staged Hermes + Codex engineering.
-version: 0.1.0
+version: 0.2.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -25,18 +25,24 @@ Act as Lead Engineer and Orchestrator. Codex A implements with `workspace-write`
 4. Invoke Codex only through `harness run-implementer` or `harness run-reviewer`. Never call `codex exec` directly.
 5. Launch long worker commands with Hermes `terminal(background=true, notify_on_complete=true)`. The launch must return a background session identifier quickly. Do not run long Codex work in a foreground tool call and do not call `process(log)`.
 6. While a worker runs, trust `harness status` (backed by the canonical Git-metadata checkpoint) and the completion notification only as wake-up signals. Business results come from validated canonical evidence; never read full worker logs by default.
-7. After Implementer handoff, run `harness run-gates`. Launch Reviewer only after gates pass. Approve a Slice only when both `quality-gates.json` and `review.json` pass.
+7. After Implementer handoff, run `harness run-gates --level fast|slice|stage` as required. Launch Reviewer only after gates pass. Approve a Slice only when both `quality-gates.json` and `review.json` pass.
 8. Limit each Slice to three A/B correction attempts (or the lower configured cap). On exhaustion, stop at `HUMAN_CHECKPOINT`.
 9. At Stage completion, update `PROJECT_STATE.md`, run `harness approve-slice --complete-stage`, and let the CLI clear replaceable runtime files. Commit only when the project/user policy authorizes it.
 
-Secure worker execution requires a writable delegated Linux cgroup v2 with
-`cgroup.kill`; child-subreaper support is defense in depth. Harness records the
-cgroup before launch and empties it before accepting a handoff, including after
-an orchestrator crash. A private user/mount/cgroup/PID namespace hides cgroup
-controls and the user-manager socket from the worker, then drops all capabilities
-and enables no-new-privileges before Codex starts, preventing same-UID migration
-out of containment. Harness copies validated implementation/gate/review evidence
-into `.git/harness-control/` and never approves from mutable runtime reports.
+This release is deliberately **trusted-local**, not a hostile-repository sandbox.
+Project code, worker commands, and quality gates still execute as the current Unix
+user. Harness uses a fresh process group, Linux child-subreaper tracking, bounded
+timeouts, and optional cgroup v2 cleanup to reclaim descendants. It does not
+require user namespaces or `unshare`, and it does not claim to contain arbitrary
+malicious repositories. Harness copies validated implementation/gate/review
+evidence into `.git/harness-control/` and never approves from mutable runtime
+reports.
+
+Gates receive a temporary `HOME` and a fixed environment allowlist. `CODEX_HOME`,
+`HERMES_HOME`, credential variables, and proxy variables are absent by default.
+Worker, Reviewer, and Gate logs are always fresh single-link owner-owned regular
+files; output redaction withholds incomplete lines so split secrets are not
+partially emitted.
 
 ## Context maintenance during worker idle time
 

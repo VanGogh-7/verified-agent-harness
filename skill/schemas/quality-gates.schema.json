@@ -4,9 +4,10 @@
   "title": "Deterministic quality-gate report",
   "type": "object",
   "additionalProperties": false,
-  "required": ["status", "gates", "completed_at"],
+  "required": ["status", "level", "gates", "completed_at"],
   "properties": {
     "status": {"type": "string", "enum": ["passed", "failed"]},
+    "level": {"type": "string", "enum": ["fast", "slice", "stage"]},
     "completed_at": {"type": "string", "maxLength": 128},
     "gates": {
       "type": "array",

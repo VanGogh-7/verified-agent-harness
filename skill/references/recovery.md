@@ -2,7 +2,7 @@
 
 ## Worker recovery
 
-Run `harness recover` after interruption. It reads current state and `orchestrator-checkpoint.json`. Current checkpoints contain a cgroup v2 identity; recovery first kills and drains that complete containment, even if its root PID remains alive, and only then examines output. For legacy PID-only checkpoints:
+Run `harness recover` after interruption. It reads current state and `orchestrator-checkpoint.json`. Every run has a random generation, and the checkpoint binds Stage, Slice, attempt, role, generation, worker identity, and Harness-owner PID identity. Recovery refuses takeover while that exact owner is alive. Only after confirmed owner death does it reclaim an optional cgroup/process tree and consider the generation-specific handoff. Stale Reviewer, attempt, or generation evidence is rejected.
 
 - live PID: report `running`; never launch a duplicate;
 - stopped PID plus valid expected handoff: reconcile the legal next state;
@@ -15,7 +15,7 @@ After a human decision, use `harness recover --retry` to resume `BLOCKED`, or `h
 
 ## Orchestrator checkpoint
 
-Before/after worker launch the Harness atomically overwrites one canonical checkpoint containing Stage, Slice, state, role, status, PID identity, cgroup identity, attempt, expected handoff, next action, unresolved findings, user constraints, compaction count, and timestamp. There are no per-attempt checkpoint archives. While an untrusted Implementer is active, the canonical checkpoint is authoritative; the project-facing runtime mirror is refreshed only through a no-follow directory descriptor when safe.
+Before/after worker launch the Harness atomically overwrites one canonical checkpoint containing Stage, Slice, state, role, generation, owner and worker PID identities, optional cgroup identity, attempt, generation-specific handoff, next action, unresolved findings, user constraints, compaction count, and timestamp. State carries a monotonic revision and updates use compare-and-swap checks. There are no per-attempt checkpoint archives.
 
 All Harness-owned runtime writes first open `.harness/` and then `runtime/` with `O_DIRECTORY | O_NOFOLLOW`, and operate relative to the resulting descriptor. Replacing the runtime directory with a symlink therefore fails closed rather than turning the host Harness into a confused-deputy writer. `recover` may inspect the canonical checkpoint without trusting that runtime path and moves the active workflow to `BLOCKED`; every other command continues to reject the symlink.
 

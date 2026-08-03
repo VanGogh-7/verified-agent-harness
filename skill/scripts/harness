@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -26,7 +27,7 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
-HARNESS_VERSION = "0.1.0"
+HARNESS_VERSION = "0.2.0"
 CONFIG_VERSION = 1
 STATES = {
     "STAGE_DISCUSSION", "STAGE_APPROVED", "SLICE_READY", "IMPLEMENTING",
@@ -53,7 +54,18 @@ REPORT_FILES = {
 }
 SECRET_NAMES = re.compile(r"(?i)(api[_-]?key|token|password|secret|credential|authorization|cookie|database_url)")
 SECRET_VALUE = re.compile(
-    r"(?i)(bearer\s+\S+|(?:[A-Z0-9_]*(?:api[_-]?key|token|password|secret|credential|authorization|cookie)|database_url)\s*[:=]\s*\S+|[a-z][a-z0-9+.-]*://[^\s:/]+:[^\s@]+@\S+|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN(?: [A-Z]+)* PRIVATE KEY-----)"
+    r"(?i)(?:"
+    r"bearer\s+[^\s,;]+|"
+    r"(?:[A-Z0-9_]*(?:api[_-]?key|token|password|secret|credential|authorization|cookie)|database_url|accountkey|sig)\s*[:=]\s*[^\s,;]+|"
+    r"(?:SharedAccessSignature\s+)?(?:sr|se|sp|sv|sig)=[^\s]+|"
+    r"[a-z][a-z0-9+.-]*://[^\s:/]+:[^\s@]+@\S+|"
+    r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}|"
+    r"gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+    r"(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|"
+    r"glpat-[0-9A-Za-z_-]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|"
+    r"sk_live_[0-9A-Za-z]{16,}|"
+    r"-----BEGIN(?: [A-Z]+)* PRIVATE KEY-----"
+    r")"
 )
 
 
@@ -157,8 +169,12 @@ def terminate_worker_tree(proc: subprocess.Popen[str], parent_waited: bool = Fal
     if proc.poll() is None:
         proc.wait()
     rc = int(proc.returncode if proc.returncode is not None else 1)
+    cgroup_error: HarnessError | None = None
     if cgroup is not None:
-        destroy_worker_cgroup(cgroup, kill=True)
+        try:
+            destroy_worker_cgroup(cgroup, kill=True)
+        except HarnessError as exc:
+            cgroup_error = exc
     for sig in (signal.SIGTERM, signal.SIGKILL):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, sig)
@@ -181,6 +197,8 @@ def terminate_worker_tree(proc: subprocess.Popen[str], parent_waited: bool = Fal
             try:
                 waited, _ = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
+                if cgroup_error is not None:
+                    raise cgroup_error
                 return rc
             if waited == 0:
                 break
@@ -201,17 +219,12 @@ def concise(text: str, limit: int) -> str:
 def read_log_tail(path: pathlib.Path, limit: int) -> str:
     """Read only a bounded tail before redaction; never load an unbounded worker log."""
     byte_limit = max(limit * 4, 4096)
-    directory_fd = open_directory_nofollow(path.parent)
-    flags = os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
-    try:
-        fd = os.open(path.name, flags, dir_fd=directory_fd)
-        with os.fdopen(fd, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - byte_limit))
-            tail = handle.read(byte_limit).decode("utf-8", errors="replace")
-    finally:
-        os.close(directory_fd)
+    fd = open_single_link_regular(path, require_owner=False)
+    with os.fdopen(fd, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - byte_limit))
+        tail = handle.read(byte_limit).decode("utf-8", errors="replace")
     return concise(tail, limit)
 
 
@@ -236,6 +249,35 @@ def open_directory_nofollow(directory: pathlib.Path) -> int:
     if not stat.S_ISDIR(os.fstat(fd).st_mode):
         os.close(fd)
         raise HarnessError("runtime path is not a directory")
+    return fd
+
+
+def validate_single_link_regular(fd: int, label: str, require_owner: bool = True) -> os.stat_result:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise HarnessError(f"{label} is not a regular file")
+    if info.st_nlink != 1:
+        raise HarnessError(f"{label} must have exactly one hard link")
+    if require_owner and info.st_uid != os.getuid():
+        raise HarnessError(f"{label} is not owned by the current user")
+    return info
+
+
+def open_single_link_regular(path: pathlib.Path, require_owner: bool = True) -> int:
+    """Open an artifact without following its final name and reject blocking/special files."""
+    directory_fd = open_directory_nofollow(path.parent)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path.name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise HarnessError(f"cannot safely open artifact {path.name}: {type(exc).__name__}") from exc
+    finally:
+        os.close(directory_fd)
+    try:
+        validate_single_link_regular(fd, f"artifact {path.name}", require_owner=require_owner)
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -294,45 +336,55 @@ def clear_directory_fd(directory_fd: int) -> None:
 
 
 def secure_log_file(path: pathlib.Path):
-    """Open a regular mode-0600 log through a no-follow parent directory fd."""
+    """Replace a log name with a fresh, single-link, owner-only regular inode."""
     directory_fd = open_directory_nofollow(path.parent)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path.name, dir_fd=directory_fd)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
     except OSError as exc:
-        os.close(directory_fd)
         raise HarnessError(f"cannot safely open runtime log {path.name}: {type(exc).__name__}") from exc
-    os.close(directory_fd)
-    info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode):
+    finally:
+        os.close(directory_fd)
+    try:
+        validate_single_link_regular(fd, f"runtime log {path.name}")
+        os.fchmod(fd, 0o600)
+    except BaseException:
         os.close(fd)
-        raise HarnessError(f"runtime log {path.name} is not a regular file")
-    os.fchmod(fd, 0o600)
+        raise
     return os.fdopen(fd, "w", encoding="utf-8")
 
 
 def stream_redacted(pipe, log) -> None:
+    # A line is withheld until its delimiter (or EOF), so a token split across
+    # arbitrary read chunks can never leak an unconfirmed suffix.
     carry = ""
     while True:
         chunk = pipe.read(4096)
         if not chunk:
             break
         carry += chunk
-        if len(carry) > 512:
-            log.write(SECRET_VALUE.sub("[REDACTED]", carry[:-256]))
-            carry = carry[-256:]
+        complete = carry.splitlines(keepends=True)
+        carry = ""
+        for item in complete:
+            if item.endswith(("\n", "\r")):
+                log.write(SECRET_VALUE.sub("[REDACTED]", item))
+            else:
+                carry = item
     if carry:
         log.write(SECRET_VALUE.sub("[REDACTED]", carry))
     log.flush()
 
 
-def run_logged(argv: list[str], root: pathlib.Path, log_path: pathlib.Path, timeout: int) -> int:
+def run_logged(argv: list[str], root: pathlib.Path, log_path: pathlib.Path, timeout: int,
+               env: dict[str, str]) -> int:
+    enable_child_subreaper()
     log = secure_log_file(log_path)
+    proc: subprocess.Popen[str] | None = None
     try:
         proc = subprocess.Popen(argv, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, env=worker_environment())
+                                text=True, env=env, start_new_session=True)
         if proc.stdout is None:
             raise HarnessError("subprocess output pipe was not created")
         reader = threading.Thread(target=stream_redacted, args=(proc.stdout, log), daemon=True)
@@ -340,14 +392,25 @@ def run_logged(argv: list[str], root: pathlib.Path, log_path: pathlib.Path, time
         try:
             rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            terminate_worker_tree(proc)
             rc = 124
+        else:
+            terminate_worker_tree(proc, parent_waited=True)
         reader.join(timeout=5)
         if reader.is_alive():
+            with contextlib.suppress(Exception):
+                proc.stdout.close()
+            reader.join(timeout=0.5)
+        if reader.is_alive():
             raise HarnessError("subprocess log drain did not terminate")
+        proc.stdout.close()
         os.fsync(log.fileno())
         return rc
+    except BaseException:
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                terminate_worker_tree(proc)
+        raise
     finally:
         log.close()
 
@@ -476,18 +539,9 @@ def state_lock(p: dict[str, pathlib.Path]):
 
 def load_json(path: pathlib.Path, max_bytes: int = 2 * 1024 * 1024) -> dict[str, Any]:
     try:
-        if path.parent.name == "runtime" and path.parent.parent.name == ".harness":
-            directory_fd = open_directory_nofollow(path.parent)
-            flags = os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
-            try:
-                fd = os.open(path.name, flags, dir_fd=directory_fd)
-                with os.fdopen(fd, "rb") as handle:
-                    raw = handle.read(max_bytes + 1)
-            finally:
-                os.close(directory_fd)
-        else:
-            with path.open("rb") as handle:
-                raw = handle.read(max_bytes + 1)
+        fd = open_single_link_regular(path, require_owner=False)
+        with os.fdopen(fd, "rb") as handle:
+            raw = handle.read(max_bytes + 1)
         if len(raw) > max_bytes:
             raise HarnessError(f"JSON artifact exceeds {max_bytes} bytes: {path}")
         value = json.loads(raw.decode("utf-8"))
@@ -502,7 +556,7 @@ def load_json(path: pathlib.Path, max_bytes: int = 2 * 1024 * 1024) -> dict[str,
     return value
 
 
-def load_state(p: dict[str, pathlib.Path], repair_mirror: bool = True) -> dict[str, Any]:
+def load_state(p: dict[str, pathlib.Path], repair_mirror: bool = False) -> dict[str, Any]:
     source = p["trusted_state"] if p["trusted_state"].exists() else p["state"]
     state = load_json(source)
     if state.get("workflow_state") not in STATES:
@@ -513,7 +567,18 @@ def load_state(p: dict[str, pathlib.Path], repair_mirror: bool = True) -> dict[s
     return state
 
 
-def save_state(p: dict[str, pathlib.Path], state: dict[str, Any], mirror: bool = True) -> None:
+def save_state(p: dict[str, pathlib.Path], state: dict[str, Any], mirror: bool = True,
+               owner_generation: str | None = None) -> None:
+    expected_revision = int(state.get("state_revision", 0))
+    if p["trusted_state"].exists():
+        current = load_json(p["trusted_state"])
+        if int(current.get("state_revision", 0)) != expected_revision:
+            raise HarnessError("state CAS conflict; reload before writing")
+        if owner_generation is not None:
+            owner = current.get("owner") or {}
+            if owner.get("generation") != owner_generation:
+                raise HarnessError("stale Harness owner generation cannot update state")
+    state["state_revision"] = expected_revision + 1
     state["updated_at"] = utc_now()
     atomic_json(p["trusted_state"], state)
     if mirror:
@@ -630,13 +695,22 @@ def worktree_fingerprint(root: pathlib.Path) -> str:
             continue
         path = root / relative
         digest.update(raw_path)
-        if path.is_file():
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            digest.update(b"missing")
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            digest.update(b"symlink:")
+            digest.update(os.fsencode(os.readlink(path)))
+        elif stat.S_ISREG(info.st_mode):
             if path.name == ".env" or path.name.startswith(".env.") or SECRET_NAMES.search(relative):
-                stat = path.stat()
-                metadata = f"secret-metadata:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_mode & 0o777}"
+                metadata = f"secret-metadata:{info.st_size}:{info.st_mtime_ns}:{info.st_mode & 0o777}"
                 digest.update(metadata.encode())
             else:
-                with path.open("rb") as handle:
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                fd = os.open(path, flags)
+                with os.fdopen(fd, "rb") as handle:
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                         digest.update(chunk)
     return digest.hexdigest()
@@ -648,6 +722,10 @@ def q(value: str) -> str:
 
 def toml_array(values: Iterable[str]) -> str:
     return "[" + ", ".join(q(str(v)) for v in values) + "]"
+
+
+def toml_commands(commands: Iterable[Iterable[str]]) -> str:
+    return "[" + ", ".join(toml_array(command) for command in commands) + "]"
 
 
 def detect_project(root: pathlib.Path) -> dict[str, Any]:
@@ -685,7 +763,7 @@ def detect_project(root: pathlib.Path) -> dict[str, Any]:
             "lint": ["cargo", "clippy", *lock, "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"],
             "check": ["cargo", "check", *lock, "--workspace", "--all-targets", "--all-features"],
             "unit_test": ["cargo", "test", *lock, "--workspace"],
-            "integration_test": ["cargo", "test", *lock, "--workspace", "--tests"],
+            "integration_test": [],
         }
         for name in ("Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"):
             if (root / name).is_file():
@@ -733,6 +811,15 @@ def detect_project(root: pathlib.Path) -> dict[str, Any]:
 
 def render_config(root: pathlib.Path, facts: dict[str, Any]) -> str:
     commands = facts["commands"]
+    is_rust = str(facts["project_type"]).startswith("rust")
+    fast_gates = [["harness", "_rust-affected-check"]] if is_rust else []
+    if is_rust and "scripts/verify" in facts["build_entrypoints"]:
+        slice_gates = [["./scripts/verify", "fast"],
+                       ["cargo", "test", "--locked", "--workspace"]]
+        stage_gates = [["./scripts/verify", "full"]]
+    else:
+        slice_gates = [value for value in commands.values() if value]
+        stage_gates = list(slice_gates)
     protected = [".git/", ".env", ".env.*", ".harness/config.toml",
                  ".harness/state.json", ".harness/runtime/",
                  "AGENTS.md", "ARCHITECTURE.md"]
@@ -748,6 +835,8 @@ build_entrypoints = {toml_array(facts["build_entrypoints"])}
 protected_paths = {toml_array(protected)}
 max_slice_attempts = 3
 error_excerpt_limit = 1200
+worker_timeout_seconds = 3600
+gate_timeout_seconds = 1800
 
 [commands]
 formatter = {toml_array(commands["formatter"])}
@@ -755,6 +844,11 @@ lint = {toml_array(commands["lint"])}
 check = {toml_array(commands["check"])}
 unit_test = {toml_array(commands["unit_test"])}
 integration_test = {toml_array(commands["integration_test"])}
+
+[gates]
+fast = {toml_commands(fast_gates)}
+slice = {toml_commands(slice_gates)}
+stage = {toml_commands(stage_gates)}
 
 [codex]
 command = ["codex"]
@@ -772,25 +866,50 @@ rehydrate_after_compaction = true
 
 
 def read_approved_plan(root: pathlib.Path, raw_path: str) -> str:
-    candidate = pathlib.Path(raw_path)
-    if candidate.is_symlink():
-        raise HarnessError("approved plan file must not be a symlink")
-    try:
-        resolved = candidate.resolve(strict=True)
-    except OSError as exc:
-        raise HarnessError("approved plan file does not exist") from exc
     project_root = root.resolve()
-    if not resolved.is_file() or not resolved.is_relative_to(project_root):
-        raise HarnessError("approved plan file must be a regular file inside the Git project")
-    relative = resolved.relative_to(project_root)
+    candidate = pathlib.Path(raw_path)
+    if candidate.is_absolute():
+        try:
+            relative = candidate.relative_to(project_root)
+        except ValueError as exc:
+            raise HarnessError("approved plan file must be inside the Git project") from exc
+    else:
+        relative = candidate
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise HarnessError("approved plan path must be a normalized project-relative path")
     if any(part in {".git", ".harness"} for part in relative.parts):
         raise HarnessError("approved plan file must not be inside .git or .harness")
     relative_text = str(relative)
-    if resolved.name == ".env" or resolved.name.startswith(".env.") or SECRET_NAMES.search(relative_text):
+    if relative.name == ".env" or relative.name.startswith(".env.") or SECRET_NAMES.search(relative_text):
         raise HarnessError("approved plan path is credential-shaped and will not be read")
-    if resolved.stat().st_size > 1024 * 1024:
-        raise HarnessError("approved plan file exceeds 1 MiB")
-    plan = resolved.read_text(encoding="utf-8")
+    directory_fd = open_directory_nofollow(project_root)
+    try:
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(relative.name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise HarnessError("approved plan file cannot be safely opened") from exc
+    finally:
+        os.close(directory_fd)
+    try:
+        info = validate_single_link_regular(fd, "approved plan file", require_owner=False)
+        if info.st_size > 1024 * 1024:
+            raise HarnessError("approved plan file exceeds 1 MiB")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise HarnessError("approved plan file exceeds 1 MiB")
+        plan = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HarnessError("approved plan file is not valid UTF-8") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
     if not plan.strip():
         raise HarnessError("the approved Stage plan file is empty")
     return plan
@@ -798,11 +917,11 @@ def read_approved_plan(root: pathlib.Path, raw_path: str) -> str:
 
 def initial_state() -> dict[str, Any]:
     now = utc_now()
-    return {"state_version": 1, "harness_version": HARNESS_VERSION,
+    return {"state_version": 1, "state_revision": 0, "harness_version": HARNESS_VERSION,
             "workflow_state": "STAGE_DISCUSSION", "stage_id": None,
             "stage_title": None, "slice_id": None, "attempt": 0,
             "gates_passed": False, "review_passed": False,
-            "validated_worktree": None, "worker": None,
+            "gate_level": None, "validated_worktree": None, "worker": None, "owner": None,
             "created_at": now, "updated_at": now,
             "recent_transitions": []}
 
@@ -851,16 +970,13 @@ def executable_version(name: str, args: list[str]) -> tuple[bool, str]:
         return False, concise(str(exc), 240)
 
 
-def doctor(_args: argparse.Namespace) -> None:
+def doctor(args: argparse.Namespace) -> None:
     root = git_root(False)
     checks: dict[str, Any] = {}
     for name, argv in (("git", ["--version"]), ("python", ["--version"]),
                        ("hermes", ["--version"]), ("codex", ["--version"])):
         executable = sys.executable if name == "python" else name
         checks[name] = executable_version(executable, argv)
-    codex_help = run_capture(["codex", "exec", "--help"]).stdout if shutil.which("codex") else ""
-    checks["codex_capabilities"] = all(flag in codex_help for flag in
-        ("--ephemeral", "--output-schema", "--output-last-message", "read-only", "workspace-write"))
     hermes_version = checks["hermes"][1]
     version_match = re.search(r"\bv?(\d+\.\d+\.\d+)\b", hermes_version)
     checks["context_plugin_compat"] = bool(version_match and version_match.group(1) == "0.19.1")
@@ -875,36 +991,34 @@ def doctor(_args: argparse.Namespace) -> None:
     checks["global_skill_installed"] = (
         hermes_home / "skills" / "software-development" / "codex-harness" / "SKILL.md"
     ).is_file()
-    try:
-        enable_child_subreaper()
-        checks["linux_child_subreaper"] = True
-    except HarnessError:
-        checks["linux_child_subreaper"] = False
-    probe_cgroup: pathlib.Path | None = None
-    try:
-        probe_cgroup = create_worker_cgroup()
-        probe = subprocess.run(
-            [sys.executable, str(pathlib.Path(__file__).resolve()), "_cgroup-exec",
-             str(probe_cgroup), "--", "/usr/bin/true"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=worker_environment(), timeout=10, check=False,
-        )
-        destroy_worker_cgroup(probe_cgroup, kill=True)
-        probe_cgroup = None
-        checks["cgroup_v2_worker_containment"] = probe.returncode == 0
-    except (HarnessError, OSError, subprocess.SubprocessError):
-        checks["cgroup_v2_worker_containment"] = False
-    finally:
-        if probe_cgroup is not None:
-            with contextlib.suppress(HarnessError):
-                destroy_worker_cgroup(probe_cgroup, kill=True)
+    if args.capabilities:
+        codex_help = run_capture(["codex", "exec", "--help"]).stdout if shutil.which("codex") else ""
+        checks["codex_capabilities"] = all(flag in codex_help for flag in
+            ("--ephemeral", "--output-schema", "--output-last-message", "read-only", "workspace-write"))
+        try:
+            enable_child_subreaper()
+            checks["linux_child_subreaper"] = True
+        except HarnessError:
+            checks["linux_child_subreaper"] = False
+        probe_cgroup: pathlib.Path | None = None
+        try:
+            probe_cgroup = create_worker_cgroup()
+            destroy_worker_cgroup(probe_cgroup, kill=True)
+            probe_cgroup = None
+            checks["cgroup_v2_optional"] = True
+        except HarnessError:
+            checks["cgroup_v2_optional"] = "unavailable (trusted-local process-group fallback active)"
+        finally:
+            if probe_cgroup is not None:
+                with contextlib.suppress(HarnessError):
+                    destroy_worker_cgroup(probe_cgroup, kill=True)
     if root and paths(root)["config"].exists():
         try:
             cfg = load_config(paths(root))
             checks["project_config"] = cfg.get("harness_version") == HARNESS_VERSION
         except Exception:
             checks["project_config"] = False
-    ok = all(v[0] if isinstance(v, tuple) else bool(v) for v in checks.values())
+    ok = all(v[0] if isinstance(v, tuple) else (v is not False) for v in checks.values())
     emit("doctor", "ok" if ok else "degraded", checks=checks)
     if not ok:
         raise HarnessError("one or more doctor checks failed or require compatibility review")
@@ -927,6 +1041,31 @@ def status(args: argparse.Namespace) -> None:
         emit("status", "ok", **value)
 
 
+def sync_config(_args: argparse.Namespace) -> None:
+    """Explicitly import project config while no Stage is active."""
+    root = git_root(True)
+    p = paths(root)
+    with state_lock(p):
+        state = load_state(p)
+        if state["workflow_state"] not in {"STAGE_DISCUSSION", "STAGE_COMPLETED"}:
+            raise HarnessError("sync-config is allowed only between active Stages")
+        raw = p["config"].read_bytes()
+        if tomllib is None:
+            raise HarnessError("Python 3.11+ is required (tomllib unavailable)")
+        try:
+            cfg = tomllib.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise HarnessError("project Harness config is invalid") from exc
+        if cfg.get("config_version") != CONFIG_VERSION or cfg.get("harness_version") != HARNESS_VERSION:
+            raise HarnessError("project Harness config version does not match this Harness")
+        atomic_write(p["trusted_config"], raw.decode("utf-8"), mode=0o600)
+        state["harness_version"] = HARNESS_VERSION
+        state.setdefault("state_revision", 0)
+        state.setdefault("owner", None)
+        save_state(p, state)
+    emit("sync-config", "ok", harness_version=HARNESS_VERSION)
+
+
 def start_stage(args: argparse.Namespace) -> None:
     root = git_root(True)
     p = paths(root)
@@ -943,7 +1082,8 @@ def start_stage(args: argparse.Namespace) -> None:
         clear_trusted_evidence(p)
         state.update({"stage_id": args.stage, "stage_title": args.title,
                       "slice_id": args.slice, "attempt": 0,
-                      "gates_passed": False, "review_passed": False, "worker": None,
+                      "gates_passed": False, "review_passed": False, "gate_level": None,
+                      "worker": None,
                       "protected_baseline": protected_snapshot(root, cfg)})
         record_transition(state, "STAGE_APPROVED", "user-approved Stage recorded")
         record_transition(state, "SLICE_READY", "first approved Slice ready")
@@ -1062,6 +1202,19 @@ def process_alive(pid: Any, expected: Any) -> bool:
     return isinstance(expected, dict) and process_identity(pid) == expected
 
 
+def owner_alive(owner: Any) -> bool:
+    return isinstance(owner, dict) and process_alive(owner.get("pid"), owner.get("identity"))
+
+
+def assert_generation(state: dict[str, Any], generation: str, role: str | None = None) -> None:
+    owner = state.get("owner") or {}
+    worker = state.get("worker") or {}
+    if owner.get("generation") != generation or worker.get("generation") != generation:
+        raise HarnessError("stale Harness generation cannot update this run")
+    if role is not None and worker.get("role") != role:
+        raise HarnessError("stale worker role cannot update this run")
+
+
 def codex_argv(cfg: dict[str, Any], root: pathlib.Path, role: str,
                schema: pathlib.Path, output: pathlib.Path) -> list[str]:
     configured = cfg.get("codex", {}).get("command", ["codex"])
@@ -1087,15 +1240,35 @@ def worker_environment() -> dict[str, str]:
     return result
 
 
+def gate_environment(temporary_home: pathlib.Path) -> dict[str, str]:
+    """Build a credential- and proxy-free allowlisted environment for trusted-local gates."""
+    allowed = {
+        "PATH", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "CARGO_HOME", "RUSTUP_HOME",
+        "CARGO_TARGET_DIR", "RUSTFLAGS", "CARGO_NET_OFFLINE", "GROUP_VERIFY_OFFLINE",
+    }
+    result = {key: value for key, value in os.environ.items()
+              if key in allowed or key.startswith("LC_")}
+    result.update({"HOME": str(temporary_home), "XDG_CONFIG_HOME": str(temporary_home / ".config"),
+                   "XDG_CACHE_HOME": str(temporary_home / ".cache"),
+                   "XDG_DATA_HOME": str(temporary_home / ".local" / "share"),
+                   "GIT_OPTIONAL_LOCKS": "0"})
+    return result
+
+
 def write_checkpoint(p: dict[str, pathlib.Path], state: dict[str, Any], role: str,
                      status_value: str, pid: int | None, report: pathlib.Path,
-                     wake_action: str, mirror: bool = True) -> None:
+                     wake_action: str, generation: str, mirror: bool = True) -> None:
+    assert_generation(state, generation, role)
     cfg = load_config(p)
     cm = cfg.get("context_maintenance", {})
     value = {"stage_id": state.get("stage_id"), "slice_id": state.get("slice_id"),
              "workflow_state": state.get("workflow_state"), "worker_role": role,
              "worker_status": status_value, "worker_session_id": None,
              "process_id": pid, "process_identity": process_identity(pid),
+             "owner_pid": (state.get("owner") or {}).get("pid"),
+             "owner_identity": (state.get("owner") or {}).get("identity"),
+             "generation": generation,
              "worker_cgroup": (state.get("worker") or {}).get("cgroup"),
              "attempt": state.get("attempt"),
              "expected_output_file": str(report), "next_action_after_completion": wake_action,
@@ -1110,15 +1283,16 @@ def write_checkpoint(p: dict[str, pathlib.Path], state: dict[str, Any], role: st
 
 
 def mark_worker_blocked(p: dict[str, pathlib.Path], role: str,
-                        proc: subprocess.Popen[str], reason: str) -> None:
+                        proc: subprocess.Popen[str], reason: str, generation: str) -> None:
     with state_lock(p):
         state = load_state(p, repair_mirror=False)
+        assert_generation(state, generation, role)
         worker = dict(state.get("worker") or {})
         worker.update({"role": role, "pid": proc.pid, "status": "failed"})
         state["worker"] = worker
         if state["workflow_state"] in {"IMPLEMENTING", "REVIEWING"}:
             record_transition(state, "BLOCKED", reason)
-        save_state(p, state, mirror=False)
+        save_state(p, state, mirror=False, owner_generation=generation)
 
 
 def cgroup_exec(args: argparse.Namespace) -> None:
@@ -1132,36 +1306,7 @@ def cgroup_exec(args: argparse.Namespace) -> None:
         (cgroup / "cgroup.procs").write_text(str(os.getpid()), encoding="ascii")
     except OSError as exc:
         raise HarnessError(f"cannot enter worker cgroup: {type(exc).__name__}") from exc
-    isolated = ["/usr/bin/unshare", "--user", "--map-root-user", "--mount", "--cgroup",
-                "--pid", "--mount-proc", "--fork", "--kill-child=KILL", sys.executable,
-                str(pathlib.Path(__file__).resolve()), "_isolated-exec",
-                f"/run/user/{os.getuid()}", "--", *command]
-    os.execvpe(isolated[0], isolated, os.environ)
-
-
-def isolated_exec(args: argparse.Namespace) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
-    mount_flags = 1 | 2 | 4 | 8  # MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC
-    targets = [pathlib.Path("/sys/fs/cgroup")]
-    runtime_dir = pathlib.Path(args.runtime_dir)
-    if runtime_dir.is_dir():
-        targets.append(runtime_dir)
-    for target in targets:
-        encoded = os.fsencode(target)
-        result = libc.mount(b"tmpfs", encoded, b"tmpfs", mount_flags, b"mode=0555")
-        if result != 0:
-            error = ctypes.get_errno()
-            raise HarnessError(f"cannot hide containment control path: errno {error}")
-    command = list(args.argv)
-    if command and command[0] == "--":
-        command = command[1:]
-    if not command:
-        raise HarnessError("isolated worker command is empty")
-    setpriv = ["/usr/bin/setpriv", "--nnp", "--bounding-set=-all", "--inh-caps=-all",
-               "--ambient-caps=-all",
-               "--securebits=+noroot,+noroot_locked,+no_setuid_fixup,+no_setuid_fixup_locked",
-               *command]
-    os.execvpe(setpriv[0], setpriv, os.environ)
+    os.execvpe(command[0], command, os.environ)
 
 
 def run_worker(args: argparse.Namespace, role: str) -> None:
@@ -1170,13 +1315,14 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
     cfg = load_config(p)
     max_attempts = int(cfg.get("max_slice_attempts", 3))
     suffix = "-dry-run" if args.dry_run else ""
-    report = p["runtime"] / (f"{role}{suffix}.json" if args.dry_run else REPORT_FILES[role])
+    report = p["runtime"] / f"{role}{suffix}.json"
     prompt_file = p["runtime"] / f"{role}{suffix}-prompt.md"
     log_file = p["runtime"] / f"{role}{suffix}.log"
     command_file = p["runtime"] / f"{role}{suffix}-command.json"
     proc: subprocess.Popen[str] | None = None
     worker_cgroup: pathlib.Path | None = None
     log_handle = None
+    generation = ""
     with state_lock(p):
         state = load_state(p)
         allowed = {"SLICE_READY", "CHANGES_REQUIRED"} if role == "implementer" else {"VALIDATING"}
@@ -1184,6 +1330,8 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
             raise HarnessError(f"run-{role} not allowed from {state['workflow_state']}")
         if role == "reviewer" and not state.get("gates_passed"):
             raise HarnessError("reviewer requires passing deterministic gates")
+        if role == "reviewer" and state.get("gate_level") not in {"slice", "stage"}:
+            raise HarnessError("reviewer requires a passing slice or stage gate")
         if args.dry_run:
             prompt = render_prompt(root, p, cfg, state, role)
             atomic_runtime_write(prompt_file, prompt)
@@ -1198,6 +1346,10 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
                  sandbox=sandbox, report=str(report.relative_to(root)))
             return
         enable_child_subreaper()
+        existing_owner = state.get("owner")
+        if owner_alive(existing_owner):
+            raise HarnessError("another live Harness owner already controls this project")
+        generation = secrets.token_hex(16)
         if role == "implementer":
             clear_trusted_evidence(p)
             if int(state.get("attempt", 0)) >= max_attempts:
@@ -1205,37 +1357,51 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
                 raise HarnessError("max_slice_attempts exceeded; HUMAN_CHECKPOINT required")
             state["attempt"] = int(state.get("attempt", 0)) + 1
             state["gates_passed"] = False
+            state["gate_level"] = None
             state["review_passed"] = False
             state["validated_worktree"] = None
             transition(p, state, "IMPLEMENTING", "Codex Implementer launch")
         else:
             transition(p, state, "REVIEWING", "independent Codex Reviewer launch")
         state = load_state(p)
-        worker_cgroup = create_worker_cgroup()
+        try:
+            worker_cgroup = create_worker_cgroup()
+        except HarnessError:
+            worker_cgroup = None
+        report = p["runtime"] / f"{role}-{generation}.json"
+        state["owner"] = {"pid": os.getpid(), "identity": process_identity(os.getpid()),
+                          "generation": generation, "claimed_at": utc_now()}
         state["worker"] = {"role": role, "pid": None, "status": "launching",
-                           "process_identity": None, "cgroup": str(worker_cgroup),
+                           "process_identity": None,
+                           "cgroup": str(worker_cgroup) if worker_cgroup else None,
+                           "generation": generation, "stage_id": state.get("stage_id"),
+                           "slice_id": state.get("slice_id"), "attempt": state.get("attempt"),
                            "expected_output": str(report), "started_at": utc_now()}
         save_state(p, state, mirror=False)
         write_checkpoint(p, state, role, "launching", None, report,
                          "run-gates" if role == "implementer" else "approve-slice",
-                         mirror=False)
+                         generation, mirror=False)
         prompt = render_prompt(root, p, cfg, state, role)
         atomic_runtime_write(prompt_file, prompt)
         runtime_unlink(report)
         argv = codex_argv(cfg, root, role, schema_path(role), report)
         sandbox = "workspace-write" if role == "implementer" else "read-only"
         atomic_runtime_json(command_file, {"argv": argv, "sandbox": sandbox, "ephemeral": True,
-                                           "cgroup": str(worker_cgroup)})
+                                           "generation": generation,
+                                           "containment": "cgroup+process-group" if worker_cgroup else "process-group",
+                                           "trusted_local": "project code executes as the current Unix user",
+                                           "cgroup": str(worker_cgroup) if worker_cgroup else None})
         log_handle = secure_log_file(log_file)
-        launch_argv = [sys.executable, str(pathlib.Path(__file__).resolve()), "_cgroup-exec",
-                       str(worker_cgroup), "--", *argv]
+        launch_argv = ([sys.executable, str(pathlib.Path(__file__).resolve()), "_cgroup-exec",
+                        str(worker_cgroup), "--", *argv] if worker_cgroup else argv)
         with prompt_file.open("r", encoding="utf-8") as stdin:
             try:
                 proc = subprocess.Popen(launch_argv, cwd=root, stdin=stdin, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, text=True, start_new_session=True,
                                         env=worker_environment())
             except OSError as exc:
-                destroy_worker_cgroup(worker_cgroup, kill=True)
+                if worker_cgroup is not None:
+                    destroy_worker_cgroup(worker_cgroup, kill=True)
                 log_handle.close()
                 log_handle = None
                 transition(p, state, "BLOCKED", f"failed to start Codex {role}")
@@ -1243,20 +1409,22 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
             identity = process_identity(proc.pid)
             state["worker"] = {"role": role, "pid": proc.pid, "status": "running",
                                "process_identity": identity, "expected_output": str(report),
-                               "cgroup": str(worker_cgroup),
+                               "cgroup": str(worker_cgroup) if worker_cgroup else None,
+                               "generation": generation, "stage_id": state.get("stage_id"),
+                               "slice_id": state.get("slice_id"), "attempt": state.get("attempt"),
                                "started_at": utc_now()}
             try:
-                save_state(p, state, mirror=False)
+                save_state(p, state, mirror=False, owner_generation=generation)
                 write_checkpoint(p, state, role, "running", proc.pid, report,
                                  "run-gates" if role == "implementer" else "approve-slice",
-                                 mirror=False)
+                                 generation, mirror=False)
             except BaseException as exc:
                 terminate_worker_tree(proc, cgroup=worker_cgroup)
                 log_handle.close()
                 log_handle = None
                 state["worker"]["status"] = "failed"
                 record_transition(state, "BLOCKED", f"failed to persist Codex {role} launch")
-                save_state(p, state, mirror=False)
+                save_state(p, state, mirror=False, owner_generation=generation)
                 if isinstance(exc, HarnessError):
                     raise
                 raise HarnessError(f"failed to persist Codex {role} launch: {type(exc).__name__}") from exc
@@ -1267,6 +1435,7 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
     if proc is not None:
         if proc.stdout is None or log_handle is None:
             raise HarnessError("Codex worker output pipe was not created")
+        pump: threading.Thread | None = None
         try:
             stream_errors: list[BaseException] = []
 
@@ -1278,9 +1447,14 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
 
             pump = threading.Thread(target=pump_output, name=f"harness-{role}-output", daemon=True)
             pump.start()
+            deadline = time.monotonic() + int(cfg.get("worker_timeout_seconds", 3600))
+            timed_out = False
             while proc.poll() is None and not stream_errors:
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
                 time.sleep(0.02)
-            if stream_errors:
+            if stream_errors or timed_out:
                 terminate_worker_tree(proc, cgroup=worker_cgroup)
             else:
                 proc.wait()
@@ -1292,27 +1466,42 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
                 pump.join(timeout=0.5)
             if pump.is_alive():
                 raise HarnessError(f"Codex {role} output pump did not terminate")
+            proc.stdout.close()
             if stream_errors:
                 raise stream_errors[0]
+            if timed_out:
+                raise HarnessError(f"Codex {role} exceeded total worker timeout")
             os.fsync(log_handle.fileno())
             log_handle.close()
             log_handle = None
             rc = int(proc.returncode if proc.returncode is not None else 1)
         except BaseException as exc:
             terminate_worker_tree(proc, cgroup=worker_cgroup)
+            with contextlib.suppress(Exception):
+                proc.stdout.close()
+            if pump is not None:
+                pump.join(timeout=0.5)
             if log_handle is not None:
                 with contextlib.suppress(Exception):
                     log_handle.close()
                 log_handle = None
-            mark_worker_blocked(p, role, proc, f"Codex {role} lifecycle failure")
+            reason = (f"Codex {role} timed out" if isinstance(exc, HarnessError) and
+                      "exceeded total worker timeout" in str(exc) else f"Codex {role} lifecycle failure")
+            mark_worker_blocked(p, role, proc, reason, generation)
+            with state_lock(p):
+                blocked_state = load_state(p, repair_mirror=False)
+                write_checkpoint(p, blocked_state, role, "failed", proc.pid, report,
+                                 "recover", generation, mirror=False)
             if isinstance(exc, HarnessError):
                 raise
             raise HarnessError(f"Codex {role} lifecycle failure: {type(exc).__name__}") from exc
         snapshot = load_state(p, repair_mirror=False)
         if rc != 0:
-            mark_worker_blocked(p, role, proc, f"Codex {role} exited {rc}")
-            write_checkpoint(p, load_state(p, repair_mirror=False), role, "failed",
-                             proc.pid, report, "recover", mirror=False)
+            mark_worker_blocked(p, role, proc, f"Codex {role} exited {rc}", generation)
+            with state_lock(p):
+                failed_state = load_state(p, repair_mirror=False)
+                write_checkpoint(p, failed_state, role, "failed",
+                                 proc.pid, report, "recover", generation, mirror=False)
             try:
                 excerpt = read_log_tail(log_file, int(cfg.get("error_excerpt_limit", 1200)))
                 atomic_runtime_write(p["runtime"] / f"{role}-error-summary.txt", excerpt + "\n")
@@ -1320,59 +1509,87 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
                 excerpt = f"Codex {role} exited {rc}; runtime log unavailable"
             raise HarnessError(f"Codex {role} failed: {excerpt}")
         try:
-            write_checkpoint(p, snapshot, role, "completed", proc.pid, report,
-                             "run-gates" if role == "implementer" else "approve-slice")
+            with state_lock(p):
+                snapshot = load_state(p, repair_mirror=False)
+                assert_generation(snapshot, generation, role)
+                write_checkpoint(p, snapshot, role, "completed", proc.pid, report,
+                                 "run-gates" if role == "implementer" else "approve-slice",
+                                 generation)
         except HarnessError:
-            mark_worker_blocked(p, role, proc, f"Codex {role} runtime integrity failure")
+            mark_worker_blocked(p, role, proc, f"Codex {role} runtime integrity failure", generation)
             raise
 
     try:
         result = validate_report(report, schema_path(role))
     except HarnessError:
         if proc is not None:
-            mark_worker_blocked(p, role, proc, f"Codex {role} produced an invalid structured handoff")
+            mark_worker_blocked(p, role, proc, f"Codex {role} produced an invalid structured handoff", generation)
         raise
+    atomic_runtime_json(p["runtime"] / REPORT_FILES[role], result)
     atomic_json(p["trusted_implementation" if role == "implementer" else "trusted_review"], result)
     with state_lock(p):
         state = load_state(p)
+        assert_generation(state, generation, role)
         state["worker"] = {"role": role, "status": "completed", "completed_at": utc_now(),
                            "expected_output": str(report)}
         if role == "implementer":
             if result["status"] == "completed":
                 if state["workflow_state"] == "IMPLEMENTING":
-                    transition(p, state, "VALIDATING", "Implementer handoff accepted")
+                    record_transition(state, "VALIDATING", "Implementer handoff accepted")
+                    save_state(p, state, owner_generation=generation)
                 elif state["workflow_state"] == "VALIDATING":
-                    save_state(p, state)
+                    save_state(p, state, owner_generation=generation)
                 else:
                     raise HarnessError(f"Implementer completed after incompatible state {state['workflow_state']}")
             else:
                 if state["workflow_state"] == "IMPLEMENTING":
-                    transition(p, state, "BLOCKED", "Implementer reported blocked")
+                    record_transition(state, "BLOCKED", "Implementer reported blocked")
+                    save_state(p, state, owner_generation=generation)
                 else:
-                    save_state(p, state)
+                    save_state(p, state, owner_generation=generation)
         else:
             if result["verdict"] == "approved":
                 state["review_passed"] = True
                 state["unresolved_findings"] = []
-                save_state(p, state)
+                save_state(p, state, owner_generation=generation)
             elif result["verdict"] == "blocked":
                 state["review_passed"] = False
                 state["unresolved_findings"] = result.get("findings", [])
                 if state["workflow_state"] == "REVIEWING":
-                    transition(p, state, "BLOCKED", "Reviewer reported an access or tooling blocker")
+                    record_transition(state, "BLOCKED", "Reviewer reported an access or tooling blocker")
+                    save_state(p, state, owner_generation=generation)
                 else:
-                    save_state(p, state)
+                    save_state(p, state, owner_generation=generation)
             else:
                 state["review_passed"] = False
                 state["unresolved_findings"] = result.get("findings", [])
                 if state["workflow_state"] == "REVIEWING":
-                    transition(p, state, "CHANGES_REQUIRED", "Reviewer requested changes")
+                    record_transition(state, "CHANGES_REQUIRED", "Reviewer requested changes")
+                    save_state(p, state, owner_generation=generation)
                 else:
-                    save_state(p, state)
+                    save_state(p, state, owner_generation=generation)
     emit(f"run-{role}", "ok", state=load_state(p)["workflow_state"], report=str(report.relative_to(root)))
 
 
-def run_gates(_args: argparse.Namespace) -> None:
+def configured_gate_commands(cfg: dict[str, Any], level: str) -> list[tuple[str, list[str]]]:
+    configured = cfg.get("gates", {}).get(level)
+    if configured is None and level == "slice":
+        legacy = cfg.get("commands", {})
+        configured = [legacy.get(name, []) for name in
+                      ("formatter", "lint", "check", "unit_test", "integration_test")]
+    if not isinstance(configured, list):
+        raise HarnessError(f"gates.{level} must be an array of command arrays")
+    result: list[tuple[str, list[str]]] = []
+    for index, argv in enumerate(configured, 1):
+        if argv == []:
+            continue
+        if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
+            raise HarnessError(f"gates.{level}[{index - 1}] must be a non-empty string array")
+        result.append((f"{level}-{index}", argv))
+    return result
+
+
+def run_gates(args: argparse.Namespace) -> None:
     root = git_root(True)
     p = paths(root)
     cfg = load_config(p)
@@ -1382,37 +1599,37 @@ def run_gates(_args: argparse.Namespace) -> None:
             raise HarnessError("run-gates requires VALIDATING")
         results = []
         all_pass = True
-        executed = 0
-        for name in ("formatter", "lint", "check", "unit_test", "integration_test"):
-            argv = cfg.get("commands", {}).get(name, [])
-            if not argv:
-                results.append({"name": name, "status": "skipped", "command": []})
-                continue
-            if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
-                raise HarnessError(f"commands.{name} must be a string array")
-            executed += 1
-            log_path = p["runtime"] / f"gate-{name}.log"
-            return_code = run_logged(argv, root, log_path, int(cfg.get("gate_timeout_seconds", 900)))
-            status = "passed" if return_code == 0 else "failed"
-            results.append({"name": name, "status": status, "command": argv, "exit_code": return_code,
-                            "log": str(log_path.relative_to(root))})
-            if return_code != 0:
-                all_pass = False
-                break
-        if executed == 0:
+        commands = configured_gate_commands(cfg, args.level)
+        if not commands:
             all_pass = False
-        report = {"status": "passed" if all_pass else "failed", "gates": results,
+        with tempfile.TemporaryDirectory(prefix="harness-gate-home-") as home:
+            env = gate_environment(pathlib.Path(home))
+            for name, argv in commands:
+                log_path = p["runtime"] / f"gate-{name}.log"
+                return_code = run_logged(argv, root, log_path,
+                                         int(cfg.get("gate_timeout_seconds", 1800)), env)
+                status_value = "passed" if return_code == 0 else "failed"
+                results.append({"name": name, "status": status_value, "command": argv,
+                                "exit_code": return_code,
+                                "log": str(log_path.relative_to(root))})
+                if return_code != 0:
+                    all_pass = False
+                    break
+        report = {"status": "passed" if all_pass else "failed", "level": args.level,
+                  "gates": results,
                   "completed_at": utc_now()}
         atomic_runtime_json(p["runtime"] / REPORT_FILES["gates"], report)
         validate_report(p["runtime"] / REPORT_FILES["gates"], skill_root() / "schemas" / "quality-gates.schema.json")
         atomic_json(p["trusted_gates"], report)
         state["gates_passed"] = all_pass
+        state["gate_level"] = args.level if all_pass else None
         if all_pass:
             state["validated_worktree"] = worktree_fingerprint(root)
             save_state(p, state)
         else:
             transition(p, state, "CHANGES_REQUIRED", "deterministic quality gate failed")
-    emit("run-gates", "ok" if all_pass else "failed", state=load_state(p)["workflow_state"], gates=len(results))
+    emit("run-gates", "ok" if all_pass else "failed", state=load_state(p)["workflow_state"],
+         level=args.level, gates=len(results))
     if not all_pass:
         raise HarnessError("quality gate failed; inspect the named runtime log deliberately")
 
@@ -1439,6 +1656,40 @@ def gofmt_check(args: argparse.Namespace) -> None:
         raise HarnessError(f"gofmt reported {len(unformatted)} unformatted file(s)")
 
 
+def rust_affected_check(_args: argparse.Namespace) -> None:
+    root = git_root(True)
+    cp = run_capture(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root)
+    if cp.returncode != 0:
+        raise HarnessError("cannot determine affected Rust crates")
+    members: set[str] = set()
+    workspace_wide = False
+    for token in cp.stdout.split("\0"):
+        if not token:
+            continue
+        relative = token[3:] if len(token) >= 3 and token[2] == " " else token
+        parts = pathlib.PurePosixPath(relative).parts
+        if len(parts) >= 2 and parts[0] == "crates":
+            manifest = root / "crates" / parts[1] / "Cargo.toml"
+            if manifest.is_file() and tomllib is not None:
+                with manifest.open("rb") as handle:
+                    name = tomllib.load(handle).get("package", {}).get("name")
+                if isinstance(name, str):
+                    members.add(name)
+        elif relative in {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"}:
+            workspace_wide = True
+    commands = [["git", "diff", "--check"], ["cargo", "fmt", "--all", "--check"]]
+    if workspace_wide:
+        commands.append(["cargo", "check", "--locked", "--workspace", "--all-targets", "--all-features"])
+    elif members:
+        package_args = [item for name in sorted(members) for item in ("-p", name)]
+        commands.append(["cargo", "check", "--locked", *package_args, "--all-targets", "--all-features"])
+        commands.append(["cargo", "test", "--locked", *package_args])
+    for argv in commands:
+        cp = subprocess.run(argv, cwd=root, env=os.environ, check=False)
+        if cp.returncode != 0:
+            raise HarnessError(f"affected-crate gate failed: {argv[0]} {argv[1]}")
+
+
 def approve_slice(args: argparse.Namespace) -> None:
     root = git_root(True)
     p = paths(root)
@@ -1449,6 +1700,10 @@ def approve_slice(args: argparse.Namespace) -> None:
             raise HarnessError("approve-slice requires REVIEWING")
         if not state.get("gates_passed") or not state.get("review_passed"):
             raise HarnessError("approval requires passing gates and approved review")
+        required_level = "stage" if args.complete_stage else "slice"
+        accepted_levels = {"stage"} if required_level == "stage" else {"slice", "stage"}
+        if state.get("gate_level") not in accepted_levels:
+            raise HarnessError(f"approval requires a passing {required_level} gate")
         implementation = validate_report(p["trusted_implementation"], schema_path("implementer"))
         gates = validate_report(p["trusted_gates"],
                                 skill_root() / "schemas" / "quality-gates.schema.json")
@@ -1476,6 +1731,7 @@ def approve_slice(args: argparse.Namespace) -> None:
             state["slice_id"] = args.next_slice
             state["attempt"] = 0
             state["gates_passed"] = False
+            state["gate_level"] = None
             state["review_passed"] = False
             state["worker"] = None
             state["validated_worktree"] = None
@@ -1530,43 +1786,81 @@ def recover(args: argparse.Namespace) -> None:
                            else p["checkpoint"] if runtime_safe else p["trusted_checkpoint"])
         checkpoint = load_json(checkpoint_path) if checkpoint_path.exists() else None
         worker = state.get("worker") or {}
+        owner = state.get("owner") or {}
         active_pid = checkpoint.get("process_id") if checkpoint else worker.get("pid")
         active_identity = (checkpoint.get("process_identity") if checkpoint
                            else worker.get("process_identity"))
         cgroup_value = (checkpoint.get("worker_cgroup") if checkpoint else None) or worker.get("cgroup")
         worker_cgroup = pathlib.Path(cgroup_value) if isinstance(cgroup_value, str) and cgroup_value else None
+        live_owner = owner_alive(owner)
         if args.retry:
             if state["workflow_state"] != "BLOCKED":
                 raise HarnessError("recover --retry requires BLOCKED")
-            if worker_cgroup is not None:
-                destroy_worker_cgroup(worker_cgroup, kill=True)
-            elif process_alive(active_pid, active_identity):
+            if live_owner:
+                raise HarnessError("cannot retry while the recorded Harness owner is still alive")
+            retry_cgroup_value = worker.get("cgroup")
+            retry_cgroup = (pathlib.Path(retry_cgroup_value)
+                            if isinstance(retry_cgroup_value, str) and retry_cgroup_value else None)
+            if retry_cgroup is not None:
+                destroy_worker_cgroup(retry_cgroup, kill=True)
+            elif process_alive(worker.get("pid"), worker.get("process_identity")):
                 raise HarnessError("cannot retry while the recorded worker process is still alive")
             target = "CHANGES_REQUIRED" if state.get("attempt", 0) else "SLICE_READY"
+            state["owner"] = None
+            state["worker"] = None
             transition(p, state, target, "human authorized recovery retry")
             emit("recover", "ok", state=target)
             return
         if args.ack_human:
             if state["workflow_state"] != "HUMAN_CHECKPOINT":
                 raise HarnessError("recover --ack-human requires HUMAN_CHECKPOINT")
+            if live_owner:
+                raise HarnessError("cannot acknowledge while the recorded Harness owner is still alive")
             state["attempt"] = 0
             state["gates_passed"] = False
             state["review_passed"] = False
+            state["gate_level"] = None
+            state["owner"] = None
+            state["worker"] = None
             transition(p, state, "SLICE_READY", "human checkpoint acknowledged")
             emit("recover", "ok", state="SLICE_READY")
             return
         if state["workflow_state"] not in {"IMPLEMENTING", "REVIEWING", "BLOCKED", "HUMAN_CHECKPOINT"}:
             emit("recover", "noop", state=state["workflow_state"])
             return
+        if live_owner:
+            emit("recover", "running", role=(checkpoint or worker).get("worker_role", worker.get("role")),
+                 pid=active_pid, owner_pid=owner.get("pid"))
+            return
+        role = checkpoint.get("worker_role") if checkpoint else worker.get("role")
+        binding_ok = bool(
+            checkpoint and role in {"implementer", "reviewer"} and
+            checkpoint.get("stage_id") == state.get("stage_id") and
+            checkpoint.get("slice_id") == state.get("slice_id") and
+            checkpoint.get("attempt") == state.get("attempt") and
+            checkpoint.get("generation") == worker.get("generation") and
+            checkpoint.get("generation") == owner.get("generation") and
+            checkpoint.get("owner_pid") == owner.get("pid") and
+            checkpoint.get("owner_identity") == owner.get("identity") and
+            worker.get("role") == role and worker.get("stage_id") == state.get("stage_id") and
+            worker.get("slice_id") == state.get("slice_id") and
+            worker.get("attempt") == state.get("attempt")
+        )
+        if checkpoint is not None and not binding_ok:
+            if state["workflow_state"] in {"IMPLEMENTING", "REVIEWING"}:
+                transition(p, state, "BLOCKED", "stale or mismatched worker checkpoint rejected")
+            emit("recover", "blocked", state=state["workflow_state"], error="checkpoint binding mismatch")
+            return
         if worker_cgroup is not None:
             destroy_worker_cgroup(worker_cgroup, kill=True)
         elif process_alive(active_pid, active_identity):
-            emit("recover", "running", role=(checkpoint or worker).get("worker_role", worker.get("role")),
-                 pid=active_pid)
+            emit("recover", "running", role=role, pid=active_pid)
             return
-        role = checkpoint.get("worker_role") if checkpoint else (state.get("worker") or {}).get("role")
         output = pathlib.Path(checkpoint["expected_output_file"]) if checkpoint and checkpoint.get("expected_output_file") else None
-        if role in {"implementer", "reviewer"} and output and output.is_file():
+        expected_output = worker.get("expected_output")
+        output_ok = bool(output and expected_output == str(output) and
+                         output.parent == p["runtime"] and output.name == f"{role}-{worker.get('generation')}.json")
+        if role in {"implementer", "reviewer"} and output_ok:
             try:
                 result = validate_report(output, schema_path(role))
             except HarnessError as exc:
@@ -1579,11 +1873,19 @@ def recover(args: argparse.Namespace) -> None:
                 # Recovery never jumps from a terminal checkpoint. Report evidence for a human decision.
                 emit("recover", "handoff-found", state=state["workflow_state"], report=str(output.relative_to(root)))
                 return
+            recovery_generation = secrets.token_hex(16)
+            state["owner"] = {"pid": os.getpid(), "identity": process_identity(os.getpid()),
+                              "generation": recovery_generation, "claimed_at": utc_now(),
+                              "recovered_generation": worker.get("generation")}
+            state["worker"] = {**worker, "generation": recovery_generation,
+                               "status": "recovered", "recovered_at": utc_now()}
             if role == "implementer" and result["status"] == "completed":
                 atomic_json(p["trusted_implementation"], result)
+                atomic_runtime_json(p["runtime"] / REPORT_FILES[role], result)
                 transition(p, state, "VALIDATING", "recovered completed Implementer handoff")
             elif role == "reviewer" and result["verdict"] == "approved":
                 atomic_json(p["trusted_review"], result)
+                atomic_runtime_json(p["runtime"] / REPORT_FILES[role], result)
                 state["review_passed"] = True
                 save_state(p, state)
             elif role == "reviewer" and result["verdict"] == "blocked":
@@ -1603,10 +1905,14 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--version", action="version", version=f"harness {HARNESS_VERSION}")
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="initialize lightweight .harness project state").set_defaults(func=init_project)
-    sub.add_parser("doctor", help="check Git, Python, Hermes, Codex, plugin, and compatibility").set_defaults(func=doctor)
+    sp = sub.add_parser("doctor", help="read-only dependency checks; capability probes are opt-in")
+    sp.add_argument("--capabilities", action="store_true",
+                    help="run explicit process/cgroup capability probes")
+    sp.set_defaults(func=doctor)
     sp = sub.add_parser("status", help="show concise workflow state")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=status)
+    sub.add_parser("sync-config", help="explicitly import config between active Stages").set_defaults(func=sync_config)
     sp = sub.add_parser("start-stage", help="record a user-approved Stage and first Slice")
     sp.add_argument("--stage", required=True)
     sp.add_argument("--title", required=True)
@@ -1618,18 +1924,18 @@ def parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=f"run Codex {role} with isolated output")
         sp.add_argument("--dry-run", action="store_true")
         sp.set_defaults(func=lambda args, r=role: run_worker(args, r))
-    sub.add_parser("run-gates", help="run configured deterministic quality gates").set_defaults(func=run_gates)
+    sp = sub.add_parser("run-gates", help="run configured deterministic quality gates")
+    sp.add_argument("--level", choices=("fast", "slice", "stage"), default="slice")
+    sp.set_defaults(func=run_gates)
     sp = sub.add_parser("_gofmt-check", help=argparse.SUPPRESS)
     sp.add_argument("files", nargs="*")
     sp.set_defaults(func=gofmt_check)
+    sp = sub.add_parser("_rust-affected-check", help=argparse.SUPPRESS)
+    sp.set_defaults(func=rust_affected_check)
     sp = sub.add_parser("_cgroup-exec", help=argparse.SUPPRESS)
     sp.add_argument("cgroup")
     sp.add_argument("argv", nargs=argparse.REMAINDER)
     sp.set_defaults(func=cgroup_exec)
-    sp = sub.add_parser("_isolated-exec", help=argparse.SUPPRESS)
-    sp.add_argument("runtime_dir")
-    sp.add_argument("argv", nargs=argparse.REMAINDER)
-    sp.set_defaults(func=isolated_exec)
     sp = sub.add_parser("approve-slice", help="approve after passing review and gates")
     group = sp.add_mutually_exclusive_group(required=True)
     group.add_argument("--next-slice")
