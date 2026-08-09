@@ -852,6 +852,16 @@ def mark_worker_blocked(p: dict[str, pathlib.Path], role: str,
                                failure_class=failure_class)
 
 
+def validate_worker_handoff_or_block(root, p, state, result, role, generation, report, pid):
+    try:
+        require_candidate_binding(root, state, result, role)
+    except HarnessError:
+        persist_blocked_worker(p, state, role, dict(state.get("worker") or {}),
+                               f"{ROLE_LABELS[role]} produced an invalid trusted handoff",
+                               generation, report, pid, root=root)
+        raise
+
+
 def agent_startup_failure_class(log_excerpt: str, report: pathlib.Path) -> str | None:
     """Classify only pre-handoff schema or exec startup failures as infrastructure."""
     if report.exists() or report.is_symlink():
@@ -1187,7 +1197,10 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
         raise
     with state_lock(p):
         state = load_state(p)
-        require_candidate_binding(root, state, result, role)
+        validate_worker_handoff_or_block(
+            root, p, state, result, role, generation, report,
+            proc.pid if proc is not None else None,
+        )
         if role == "implementer":
             state["candidate_id"] = result["candidate_id"]
         atomic_runtime_json(p["runtime"] / REPORT_FILES[role], result)
