@@ -1,4 +1,4 @@
-"""Codex Harness context-maintenance tools for Hermes Agent 0.19.1.
+"""verified-agent-harness context-maintenance tools for Hermes Agent 0.19.1.
 
 This plugin deliberately does not mutate the active transcript from inside a
 tool call. The current public PluginContext has no safe post-tool compaction API;
@@ -147,9 +147,9 @@ def register(ctx) -> None:
             guidance = "Finish the current tool turn, then use /compress. Never compress while this tool call is outstanding."
         return _result(action=action, compacted=False, guidance=guidance, **value)
 
-    ctx.register_tool(name="harness_context_status", toolset="codex_harness",
+    ctx.register_tool(name="harness_context_status", toolset="verified_agent_harness",
                       schema=status_schema, handler=status_handler,
                       description=status_schema["description"], emoji="🧭")
-    ctx.register_tool(name="harness_compact_if_needed", toolset="codex_harness",
+    ctx.register_tool(name="harness_compact_if_needed", toolset="verified_agent_harness",
                       schema=compact_schema, handler=compact_handler,
                       description=compact_schema["description"], emoji="🗜️")

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import stat
 import subprocess
@@ -11,6 +12,8 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +44,38 @@ def snapshot(path: Path):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_plugin_config_migration_rejects_conflicting_activation(self):
+        updated_config = runpy.run_path(str(ROOT / "scripts" / "configure-hermes"))["updated_config"]
+        config = {
+            "plugins": {
+                "enabled": ["codex-harness-context"],
+                "disabled": ["verified-agent-harness-context"],
+                "entries": {},
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "both enabled and disabled"):
+            updated_config(config)
+
+    def test_plugin_registration_uses_verified_agent_identity(self):
+        plugin_path = ROOT / "plugin" / "__init__.py"
+        plugin_spec = importlib.util.spec_from_file_location("verified_agent_harness_plugin", plugin_path)
+        assert plugin_spec is not None and plugin_spec.loader is not None
+        plugin_module = importlib.util.module_from_spec(plugin_spec)
+        plugin_spec.loader.exec_module(plugin_module)
+
+        class Context:
+            def __init__(self):
+                self.calls = []
+
+            def register_tool(self, **kwargs):
+                self.calls.append(kwargs)
+
+        context = Context()
+        plugin_module.register(context)
+        self.assertEqual(len(context.calls), 2)
+        self.assertEqual({call["toolset"] for call in context.calls}, {"verified_agent_harness"})
+        self.assertNotIn("Codex Harness", plugin_module.__doc__ or "")
+
     def fixture(self):
         temp = tempfile.TemporaryDirectory(prefix="deployment-test-")
         base = Path(temp.name)
@@ -58,7 +93,15 @@ class DeploymentTests(unittest.TestCase):
         (bin_dir / "harness").write_text("old launcher\n", encoding="utf-8")
         (group / ".harness/config.toml").write_text("old config\n", encoding="utf-8")
         (hermes / "config.yaml").write_text(
-            "model: test\nmemory:\n  memory_enabled: true\nskills:\n  creation_nudge_interval: 10\n",
+            "model: test\n"
+            "memory:\n  memory_enabled: true\n"
+            "skills:\n  creation_nudge_interval: 10\n"
+            "plugins:\n"
+            "  enabled: [codex-harness-context, observability/langfuse]\n"
+            "  disabled: []\n"
+            "  entries:\n"
+            "    codex-harness-context:\n"
+            "      allow_tool_override: false\n",
             encoding="utf-8")
         (hermes / "codex-harness-deployment-manifest.json").write_text("old manifest\n", encoding="utf-8")
         env = {**os.environ, "HERMES_DEPLOY_HOME": str(hermes),
@@ -389,6 +432,12 @@ class DeploymentTests(unittest.TestCase):
             self.assertEqual((bin_dir / "harness").read_bytes(), (payload / "bin/harness").read_bytes())
             self.assertEqual((group / ".harness/config.toml").read_bytes(),
                              (payload / "projects/Group/config.toml").read_bytes())
+            configured = yaml.safe_load((hermes / "config.yaml").read_text(encoding="utf-8"))
+            self.assertIn("verified-agent-harness-context", configured["plugins"]["enabled"])
+            self.assertNotIn("codex-harness-context", configured["plugins"]["enabled"])
+            self.assertEqual(configured["plugins"]["entries"]["verified-agent-harness-context"],
+                             {"allow_tool_override": False})
+            self.assertNotIn("codex-harness-context", configured["plugins"]["entries"])
             manifest = hermes / "verified-agent-harness-deployment-manifest.json"
             self.assertIn("deployment_manifest_sha256=", result.stdout)
             self.assertEqual(json.loads(manifest.read_text())["frozen_commit"], "test-frozen-commit")
@@ -416,6 +465,12 @@ class DeploymentTests(unittest.TestCase):
         try:
             result = self.deploy(payload, env)
             self.assertEqual(result.returncode, 0, result.stderr)
+            launcher = bin_dir / "harness"
+            run_env = {**env, "HERMES_HOME": str(hermes)}
+            version = subprocess.run([str(launcher), "--version"], cwd=base, env=run_env,
+                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(version.returncode, 0, version.stdout + version.stderr)
+            self.assertEqual(version.stdout.strip(), "harness 1.0.0")
             project = base / "InstalledProject"
             project.mkdir()
             subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project, check=True)
@@ -446,8 +501,6 @@ class DeploymentTests(unittest.TestCase):
                 "# Harness Adoption Report\n\nEnglish architecture and validation constraints are approved.\n\n"
                 "<!-- harness-adoption-approval:start -->\n<APPROVAL_MANIFEST>\n"
                 "<!-- harness-adoption-approval:end -->\n", encoding="utf-8")
-            launcher = bin_dir / "harness"
-            run_env = {**env, "HERMES_HOME": str(hermes)}
             assess = subprocess.run([str(launcher), "assess", "--analyst-report", "analyst.json",
                                      "--auditor-report", "auditor.json", "--json"],
                                     cwd=project, env=run_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

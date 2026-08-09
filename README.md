@@ -25,6 +25,8 @@ flowchart LR
     CP[(.git/harness-control<br/>trusted canonical evidence)] --- A
 ```
 
+The repository distributes two cooperating Skills as one verified system. `project-lifecycle-harness` is the upper-level entry point that classifies and harnesses a repository; once a project is compatible and activated, the top-level router delegates Stage/Slice execution to `verified-agent-harness`. They are installed and regression-tested together rather than versioned as unrelated components.
+
 The repository has four cooperating layers:
 
 - `skill/` is the exact split 1.0.0 Stage/Slice Skill: a small launcher, `harness_core.py`, `harness_commands.py`, strict contracts, templates, references, and its local test suite.

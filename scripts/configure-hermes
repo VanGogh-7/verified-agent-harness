@@ -18,11 +18,37 @@ def updated_config(config):
     memory = dict(result.get("memory", {}))
     skills = dict(result.get("skills", {}))
     curator = dict(result.get("curator", {}))
+    plugins = dict(result.get("plugins", {}))
+    legacy_plugin = "codex-harness-context"
+    current_plugin = "verified-agent-harness-context"
+    for key in ("enabled", "disabled"):
+        values = plugins.get(key, [])
+        if not isinstance(values, list):
+            raise ValueError(f"plugins.{key} must be a list")
+        migrated = []
+        for value in values:
+            renamed = current_plugin if value == legacy_plugin else value
+            if renamed not in migrated:
+                migrated.append(renamed)
+        plugins[key] = migrated
+    if current_plugin in plugins["enabled"] and current_plugin in plugins["disabled"]:
+        raise ValueError("verified-agent-harness plugin cannot be both enabled and disabled")
+    entries = plugins.get("entries", {})
+    if not isinstance(entries, dict):
+        raise ValueError("plugins.entries must be a mapping")
+    entries = dict(entries)
+    if legacy_plugin in entries:
+        if current_plugin in entries and entries[current_plugin] != entries[legacy_plugin]:
+            raise ValueError("conflicting legacy and current verified-agent-harness plugin entries")
+        entries.setdefault(current_plugin, entries[legacy_plugin])
+        del entries[legacy_plugin]
+    plugins["entries"] = entries
     memory.update({"memory_enabled": False, "user_profile_enabled": False,
                    "nudge_interval": 0, "write_approval": True})
     skills.update({"creation_nudge_interval": 0, "write_approval": True})
     curator["enabled"] = False
-    result.update({"memory": memory, "skills": skills, "curator": curator})
+    result.update({"memory": memory, "skills": skills, "curator": curator,
+                   "plugins": plugins})
     return result
 
 
