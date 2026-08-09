@@ -1015,9 +1015,9 @@ Path(args.output).write_text(json.dumps({
             self.assertIn("requested_reasoning_effort", command)
 
     def test_state_machine_docs_match_recovery_edge(self) -> None:
-        self.assertNotIn("VALIDATING", H["TRANSITIONS"]["CHANGES_REQUIRED"])
+        self.assertIn("ASSESSING", H["TRANSITIONS"]["CHANGES_REQUIRED"])
         docs = (SKILL_ROOT / "references/state-machine.md").read_text(encoding="utf-8")
-        self.assertIn("CHANGES_REQUIRED -> IMPLEMENTING | HUMAN_CHECKPOINT", docs)
+        self.assertIn("CHANGES_REQUIRED -> IMPLEMENTING | ASSESSING", docs)
 
     def test_current_stage_serialization_has_one_terminal_newline(self) -> None:
         temp, _root, paths = self.make_harness_repo()

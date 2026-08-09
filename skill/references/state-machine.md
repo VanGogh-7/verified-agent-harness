@@ -25,7 +25,7 @@ IMPLEMENTING -> VALIDATING | BLOCKED | HUMAN_CHECKPOINT
 VALIDATING -> ASSESSING | CHANGES_REQUIRED | BLOCKED | HUMAN_CHECKPOINT
 ASSESSING -> VERIFYING | BLOCKED | HUMAN_CHECKPOINT
 VERIFYING -> CHANGES_REQUIRED | APPROVED | BLOCKED | HUMAN_CHECKPOINT
-CHANGES_REQUIRED -> IMPLEMENTING | HUMAN_CHECKPOINT | BLOCKED
+CHANGES_REQUIRED -> IMPLEMENTING | ASSESSING | HUMAN_CHECKPOINT | BLOCKED
 APPROVED -> SLICE_READY | STAGE_COMPLETED | CHANGES_REQUIRED
 BLOCKED -> SLICE_READY | ASSESSING | CHANGES_REQUIRED | HUMAN_CHECKPOINT
 HUMAN_CHECKPOINT -> SLICE_READY | CHANGES_REQUIRED | BLOCKED
@@ -35,5 +35,7 @@ STAGE_COMPLETED -> STAGE_APPROVED
 Assessor completion does not transition to repair or approval. Correctness Reviewer starts `VALIDATING -> ASSESSING`; later assessor reports accumulate in `ASSESSING`. Verifier alone performs `ASSESSING -> VERIFYING`, then makes one decision edge. A new Implementer attempt clears gates, assessor reports, Verifier report, candidate identity, and counters before entering `IMPLEMENTING`.
 
 The narrow `APPROVED -> CHANGES_REQUIRED` edge is used only by operator-authorized `recover --reopen-review` before Slice acceptance.
+
+The narrow `CHANGES_REQUIRED -> ASSESSING` edge is used only to retry a semantically invalid Verifier handoff before any Verifier decision has been accepted.
 
 A required Tester outcome of `flaky_or_infra` enters `BLOCKED`. An authorized infrastructure retry returns directly to `ASSESSING` with the same candidate attempt; it does not create an Implementer repair attempt.
