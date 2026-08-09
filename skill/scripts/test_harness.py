@@ -114,9 +114,12 @@ class ContractTests(unittest.TestCase):
                                "activate_project"):
             self.assertNotIn(implementation, H)
         self.assertNotIn("detect_lifecycle", H)
-        router = (SKILL_ROOT.parent / "bin/harness").read_text(encoding="utf-8")
-        self.assertIn("detect|assess|bootstrap|adopt|activate|rollback-gc", router)
-        self.assertIn('SCRIPT="$LIFECYCLE_SCRIPT"', router)
+        router_path = SKILL_ROOT.parent / "bin/harness"
+        if router_path.is_file():
+            # The top-level router is part of the source repository, not the installed Skill payload.
+            router = router_path.read_text(encoding="utf-8")
+            self.assertIn("detect|assess|bootstrap|adopt|activate|rollback-gc", router)
+            self.assertIn('SCRIPT="$LIFECYCLE_SCRIPT"', router)
 
     def test_versions_are_synchronized(self) -> None:
         self.assertEqual(H["HARNESS_VERSION"], "1.0.0")
