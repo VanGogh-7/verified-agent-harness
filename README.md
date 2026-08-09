@@ -38,9 +38,30 @@ The configured Orchestrator owns operator interaction and outer task coordinatio
 
 ## Agent adapter contract
 
-The core invokes `[agent_runtime].adapter_argv` directly without a shell. It appends canonical role, access, workdir, prompt, JSON Schema, output path, model alias, and ephemerality arguments. Only Implementer may receive `workspace-write`; every assessor and Verifier receives `read-only`. The trusted adapter is responsible for enforcing that access mode. The core independently recomputes candidate identity and rejects evidence after any mutation, but this is detection rather than kernel-level containment. An adapter must also implement `--describe` and return contract version `1.0`.
+The core invokes `[agent_runtime].adapter_argv` directly without a shell. It appends canonical role, access, workdir, prompt, JSON Schema, output path, optional model alias, optional per-role reasoning effort, and ephemerality arguments. Only Implementer may receive `workspace-write`; every assessor, Verifier, adviser, and lifecycle label receives `read-only`. The trusted adapter is responsible for enforcing that access mode. The core independently recomputes candidate identity and rejects evidence after any mutation, but this is detection rather than kernel-level containment. An adapter must also implement secret-free `--describe` with contract version `1.1` and routing capabilities.
 
 The repository ships `skill/adapters/codex_cli.py` as a reference adapter for the user's current setup. Other agent CLIs are supported only after an adapter implements the executable contract in `skill/references/adapter-contract.md` and passes the contract and workflow tests. Merely changing a product name or prompt does not establish compatibility.
+
+### Bundled Codex routing policy
+
+Generic templates remain provider-neutral: `[agent_runtime.models]` and `[agent_runtime.reasoning_efforts]` are optional role-keyed adapter inputs. The bundled Group deployment explicitly uses the following reference-adapter policy:
+
+| Role | Model/reasoning |
+|---|---|
+| Implementer | Terra/xhigh |
+| Correctness Reviewer | Sol/medium |
+| Tester | Terra/xhigh |
+| Security Reviewer | Sol/medium |
+| Verifier | Sol/medium |
+| Explorer | Luna/xhigh |
+| Researcher | Terra/xhigh |
+| Test Triage | Luna/xhigh |
+| Log Triage | Luna/xhigh |
+| Architecture Analyst | Terra/xhigh |
+| Independent Auditor | Sol/medium |
+| Final Lifecycle Reviewer | Sol/medium |
+
+The reference adapter derives `medium` for configured Sol and `xhigh` for configured Terra or Luna when the role effort is omitted; an explicit valid role effort wins. The lifecycle labels are read-only routing labels only: lifecycle state remains outside the Stage engine.
 
 ## Workflow classes
 
@@ -57,6 +78,7 @@ The repository ships `skill/adapters/codex_cli.py` as a reference adapter for th
 - The Implementer is the only ordinary source writer in a candidate worktree.
 - Gates run configured argument arrays without a shell.
 - Reviewer, Tester, optional Security Reviewer, and Verifier are read-only.
+- Explorer, Researcher, Test Triage, and Log Triage are optional read-only, non-authoritative advisers. `harness run-advisory --role <role>` is their one bounded command. Advice is structured and candidate-bound during a Stage, but is runtime-only: it cannot mutate source, satisfy an assessment, enter the Verifier join, approve, or force repair.
 - Assessors produce hypotheses, not approval. The Verifier classifies every finding as `confirmed`, `rejected`, `inconclusive`, or `flaky_or_infra`.
 - Only confirmed policy-blocking findings enter `CHANGES_REQUIRED`. Policy-blocking inconclusive evidence fails closed to `BLOCKED`.
 - Approval rereads canonical reports and recomputes the current candidate, protected baseline, Git HEAD, and worktree identity.
@@ -123,6 +145,15 @@ harness approve-slice --complete-stage
 ```
 
 For a security-sensitive Stage, select `--workflow SECURITY` at Stage start and run `harness run-security-reviewer` before the Verifier. Workflow policy cannot be toggled during an active Stage.
+
+Use optional advice without changing the Stage evidence DAG:
+
+```bash
+harness run-advisory --role explorer
+harness run-advisory --role log_triage --dry-run
+```
+
+`run-advisory` refuses while another worker or gate is active. Its runtime evidence records the requested model and reasoning effort but never becomes trusted approval evidence.
 
 Inspect identity and state without granting approval:
 

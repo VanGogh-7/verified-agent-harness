@@ -142,10 +142,7 @@ def doctor(args: argparse.Namespace) -> None:
             adapter = expanded_adapter_argv(cfg)
             result = run_capture([*adapter, "--describe"], timeout=20)
             description = json.loads(result.stdout) if result.returncode == 0 else None
-            checks["agent_adapter"] = bool(
-                isinstance(description, dict)
-                and description.get("contract_version") == "1.0"
-            )
+            checks["agent_adapter"] = adapter_contract_compatible(description)
         except Exception:
             checks["agent_adapter"] = False
     if args.capabilities:
@@ -353,6 +350,11 @@ def schema_path(role: str) -> pathlib.Path:
     return skill_root() / "references" / "contracts" / name
 
 
+def advisory_schema_path() -> pathlib.Path:
+    """Return the single non-authoritative advisory handoff contract."""
+    return skill_root() / "references" / "contracts" / "advisory.schema.json"
+
+
 def validate_schema_value(value: Any, schema: dict[str, Any], where: str = "$") -> None:
     expected = schema.get("type")
     if expected == "object":
@@ -533,6 +535,27 @@ def render_prompt(root: pathlib.Path, p: dict[str, pathlib.Path], cfg: dict[str,
     return template
 
 
+def render_advisory_prompt(root: pathlib.Path, p: dict[str, pathlib.Path], state: dict[str, Any],
+                           role: str, base_sha: str, candidate_id: str) -> str:
+    if role not in ADVISORY_ROLE_KEYS:
+        raise HarnessError(f"unknown advisory role: {role}")
+    template = (skill_root() / "templates" / "advisory-prompt.md").read_text(encoding="utf-8")
+    stage_source = p["trusted_stage"] if p["trusted_stage"].exists() else p["stage"]
+    replacements = {
+        "{{ADVISORY_ROLE}}": ROLE_LABELS[role],
+        "{{PROJECT_ROOT}}": str(root),
+        "{{STAGE_ID}}": str(state.get("stage_id")),
+        "{{SLICE_ID}}": str(state.get("slice_id")),
+        "{{ATTEMPT}}": str(state.get("attempt")),
+        "{{BASE_SHA}}": base_sha,
+        "{{CANDIDATE_ID}}": candidate_id,
+        "{{CURRENT_STAGE}}": read_single_link_text(stage_source, "current Stage"),
+    }
+    for key, value in replacements.items():
+        template = template.replace(key, value)
+    return template
+
+
 def process_identity(pid: Any) -> dict[str, Any] | None:
     if not isinstance(pid, int) or pid <= 0:
         return None
@@ -569,6 +592,13 @@ ROLE_LABELS = {
     "tester": "Tester",
     "security_reviewer": "Security Reviewer",
     "verifier": "Verifier",
+    "explorer": "Explorer",
+    "researcher": "Researcher",
+    "test_triage": "Test Triage",
+    "log_triage": "Log Triage",
+    "architecture_analyst": "Architecture Analyst",
+    "auditor": "Independent Auditor",
+    "final_lifecycle_reviewer": "Final Lifecycle Reviewer",
 }
 
 
@@ -589,12 +619,9 @@ def agent_adapter_argv(cfg: dict[str, Any], root: pathlib.Path, role: str,
     runtime = cfg.get("agent_runtime", {})
     if runtime.get("ephemeral") is not True:
         raise HarnessError("[agent_runtime].ephemeral must be true")
-    models = runtime.get("models", {})
-    if not isinstance(models, dict):
-        raise HarnessError("[agent_runtime.models] must be a table")
+    models, reasoning_efforts = runtime_role_routing(runtime)
     model = models.get(role, "")
-    if not isinstance(model, str) or (model and not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", model)):
-        raise HarnessError(f"[agent_runtime.models].{role} is invalid")
+    reasoning_effort = reasoning_efforts.get(role, "")
     access = "workspace-write" if role == "implementer" else "read-only"
     return [
         *expanded_adapter_argv(cfg),
@@ -605,6 +632,7 @@ def agent_adapter_argv(cfg: dict[str, Any], root: pathlib.Path, role: str,
         "--schema", str(schema),
         "--output", str(output),
         "--model-alias", model,
+        "--reasoning-effort", reasoning_effort,
         "--ephemeral", "true",
     ]
 
@@ -884,9 +912,12 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
             argv = agent_adapter_argv(
                 cfg, root, role, prompt_file, schema_path(role), report
             )
+            models, reasoning_efforts = runtime_role_routing(cfg["agent_runtime"])
             sandbox = "workspace-write" if role == "implementer" else "read-only"
             atomic_runtime_json(command_file, {"argv": argv, "sandbox": sandbox,
-                                               "ephemeral": True, "dry_run": True})
+                                               "ephemeral": True, "dry_run": True,
+                                               "requested_model": models.get(role, ""),
+                                               "requested_reasoning_effort": reasoning_efforts.get(role, "")})
             atomic_runtime_write(log_file, "SYNTHETIC WORKER OUTPUT ISOLATION CHECK\n")
             atomic_runtime_json(report, {"dry_run": True, "would_launch": argv,
                                          "workflow_state_unchanged": state["workflow_state"]})
@@ -991,9 +1022,12 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
         argv = agent_adapter_argv(
             cfg, root, role, prompt_file, schema_path(role), report
         )
+        models, reasoning_efforts = runtime_role_routing(cfg["agent_runtime"])
         sandbox = "workspace-write" if role == "implementer" else "read-only"
         atomic_runtime_json(command_file, {"argv": argv, "sandbox": sandbox, "ephemeral": True,
                                            "generation": generation,
+                                           "requested_model": models.get(role, ""),
+                                           "requested_reasoning_effort": reasoning_efforts.get(role, ""),
                                            "containment": "cgroup+process-group" if worker_cgroup else "process-group",
                                            "trusted_local": "project code executes as the current Unix user",
                                            "cgroup": str(worker_cgroup) if worker_cgroup else None})
@@ -1779,6 +1813,10 @@ def parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=f"run {ROLE_LABELS[role]} with isolated output")
         sp.add_argument("--dry-run", action="store_true")
         sp.set_defaults(func=lambda args, r=role: run_worker(args, r))
+    sp = sub.add_parser("run-advisory", help="run one optional non-authoritative read-only advisory role")
+    sp.add_argument("--role", required=True, choices=tuple(sorted(ADVISORY_ROLE_KEYS)))
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(func=run_advisory)
     sp = sub.add_parser("run-gates", help="run configured deterministic quality gates")
     sp.add_argument("--level", choices=("fast", "slice", "stage"), default="slice")
     sp.set_defaults(func=run_gates)

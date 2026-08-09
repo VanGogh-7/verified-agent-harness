@@ -31,7 +31,33 @@ except ModuleNotFoundError:  # Python < 3.11
 HARNESS_VERSION = "1.0.0"
 CONFIG_VERSION = 1
 LIFECYCLE_VERSION = 1
+ADAPTER_CONTRACT_VERSION = "1.1"
 COMPATIBLE_HARNESS_VERSIONS = {"0.4.0", HARNESS_VERSION}
+STAGE_ROLE_KEYS = frozenset({
+    "implementer", "reviewer", "tester", "security_reviewer", "verifier",
+})
+ADVISORY_ROLE_KEYS = frozenset({
+    "explorer", "researcher", "test_triage", "log_triage",
+})
+LIFECYCLE_ROLE_KEYS = frozenset({
+    "architecture_analyst", "auditor", "final_lifecycle_reviewer",
+})
+RUNTIME_ROLE_LABELS = {
+    "implementer": "Implementer",
+    "reviewer": "Correctness Reviewer",
+    "tester": "Tester",
+    "security_reviewer": "Security Reviewer",
+    "verifier": "Verifier",
+    "explorer": "Explorer",
+    "researcher": "Researcher",
+    "test_triage": "Test Triage",
+    "log_triage": "Log Triage",
+    "architecture_analyst": "Architecture Analyst",
+    "auditor": "Independent Auditor",
+    "final_lifecycle_reviewer": "Final Lifecycle Reviewer",
+}
+RUNTIME_ROLE_KEYS = STAGE_ROLE_KEYS | ADVISORY_ROLE_KEYS | LIFECYCLE_ROLE_KEYS
+REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max", "ultra"})
 STATES = {
     "STAGE_DISCUSSION", "STAGE_APPROVED", "SLICE_READY", "IMPLEMENTING",
     "VALIDATING", "ASSESSING", "VERIFYING", "CHANGES_REQUIRED", "APPROVED", "BLOCKED",
@@ -595,6 +621,51 @@ def load_json(path: pathlib.Path, max_bytes: int = 2 * 1024 * 1024) -> dict[str,
     return value
 
 
+def control_artifact_snapshot(p: dict[str, pathlib.Path]) -> dict[str, tuple[str, int] | None]:
+    """Capture bounded canonical control artifacts around an untrusted read-only adapter."""
+    keys = (
+        "config", "state", "project", "stage", "trusted_config", "trusted_state",
+        "trusted_stage", "trusted_checkpoint", "trusted_implementation", "trusted_gates",
+        "trusted_review", "trusted_test", "trusted_security_review", "trusted_verification",
+    )
+    snapshot: dict[str, tuple[str, int] | None] = {}
+    for key in keys:
+        path = p[key]
+        if not path.exists() and not path.is_symlink():
+            snapshot[key] = None
+            continue
+        fd = open_single_link_regular(path, require_owner=False)
+        try:
+            info = os.fstat(fd)
+            if info.st_size > 2 * 1024 * 1024:
+                raise HarnessError(f"control artifact exceeds 2 MiB: {path.name}")
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                raw = handle.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise HarnessError(f"control artifact exceeds 2 MiB: {path.name}")
+            snapshot[key] = (raw.decode("utf-8"), info.st_mode & 0o777)
+        except UnicodeDecodeError as exc:
+            raise HarnessError(f"control artifact is not UTF-8: {path.name}") from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    return snapshot
+
+
+def restore_control_artifacts(p: dict[str, pathlib.Path],
+                              snapshot: dict[str, tuple[str, int] | None]) -> None:
+    """Restore the exact pre-advisory canonical control set after a TCB violation."""
+    for key, saved in snapshot.items():
+        path = p[key]
+        if saved is None:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            continue
+        text, mode = saved
+        atomic_write(path, text, mode=mode)
+
+
 def load_state(p: dict[str, pathlib.Path], repair_mirror: bool = False) -> dict[str, Any]:
     source = p["trusted_state"] if p["trusted_state"].exists() else p["state"]
     state = load_json(source)
@@ -686,15 +757,7 @@ def load_config(p: dict[str, pathlib.Path]) -> dict[str, Any]:
         raise HarnessError("[agent_runtime].adapter_argv must be a non-empty string array")
     if runtime.get("ephemeral") is not True:
         raise HarnessError("[agent_runtime].ephemeral must be true")
-    models = runtime.get("models", {})
-    if not isinstance(models, dict):
-        raise HarnessError("[agent_runtime.models] must be a table")
-    allowed_models = {"implementer", "reviewer", "tester", "security_reviewer", "verifier"}
-    if not set(models).issubset(allowed_models):
-        raise HarnessError("[agent_runtime.models] contains an unknown role")
-    if not all(isinstance(alias, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", alias)
-               for alias in models.values()):
-        raise HarnessError("[agent_runtime.models] aliases are invalid")
+    runtime_role_routing(runtime)
     if cfg.get("harness_version") == HARNESS_VERSION:
         language = cfg.get("language", {})
         required_language = {
@@ -705,6 +768,156 @@ def load_config(p: dict[str, pathlib.Path]) -> dict[str, Any]:
         if any(language.get(key) != value for key, value in required_language.items()):
             raise HarnessError("[language] must preserve the canonical English boundary")
     return cfg
+
+
+def runtime_role_routing(runtime: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+    """Validate provider-neutral, optional role routing without deriving provider policy."""
+    models = runtime.get("models", {})
+    if not isinstance(models, dict):
+        raise HarnessError("[agent_runtime.models] must be a table")
+    if not set(models).issubset(RUNTIME_ROLE_KEYS):
+        raise HarnessError("[agent_runtime.models] contains an unknown role")
+    if not all(isinstance(alias, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", alias)
+               for alias in models.values()):
+        raise HarnessError("[agent_runtime.models] aliases are invalid")
+    efforts = runtime.get("reasoning_efforts", {})
+    if not isinstance(efforts, dict):
+        raise HarnessError("[agent_runtime.reasoning_efforts] must be a table")
+    if not set(efforts).issubset(RUNTIME_ROLE_KEYS):
+        raise HarnessError("[agent_runtime.reasoning_efforts] contains an unknown role")
+    if not all(isinstance(effort, str) and effort in REASONING_EFFORTS
+               for effort in efforts.values()):
+        raise HarnessError("[agent_runtime.reasoning_efforts] values are invalid")
+    return models, efforts
+
+
+def adapter_contract_compatible(description: Any) -> bool:
+    """Require the advertised routing fields before launching an adapter."""
+    if not isinstance(description, dict) or description.get("contract_version") != ADAPTER_CONTRACT_VERSION:
+        return False
+    capabilities = description.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return False
+    role_access = capabilities.get("role_access")
+    efforts = capabilities.get("reasoning_efforts")
+    expected_access = {
+        label: ("workspace-write" if key == "implementer" else "read-only")
+        for key, label in RUNTIME_ROLE_LABELS.items()
+    }
+    return bool(
+        capabilities.get("structured_output") is True
+        and capabilities.get("ephemeral") is True
+        and role_access == expected_access
+        and isinstance(efforts, list)
+        and REASONING_EFFORTS.issubset(set(efforts))
+    )
+
+
+def advisory_runtime_evidence(role: str, base_sha: str, candidate_id: str,
+                              state: dict[str, Any], model: str, reasoning_effort: str,
+                              report: pathlib.Path, root: pathlib.Path, *, dry_run: bool,
+                              status: str, advice: list[dict[str, Any]] | None = None,
+                              limitations: list[str] | None = None) -> dict[str, Any]:
+    """Build an explicitly untrusted advisory record without affecting Stage evidence."""
+    return {
+        "advisory_only": True, "role": role, "role_label": ROLE_LABELS[role],
+        "access": "read-only", "dry_run": dry_run, "status": status,
+        "stage_id": state.get("stage_id"), "slice_id": state.get("slice_id"),
+        "attempt": state.get("attempt"), "base_sha": base_sha,
+        "candidate_id": candidate_id, "requested_model": model,
+        "requested_reasoning_effort": reasoning_effort,
+        "report": str(report.relative_to(root)), "advice": advice or [],
+        "limitations": limitations or [], "recorded_at": utc_now(),
+    }
+
+
+def run_advisory(args: argparse.Namespace) -> None:
+    """Run one optional reader without creating Stage evidence or state transitions."""
+    role = args.role
+    if role not in ADVISORY_ROLE_KEYS:
+        raise HarnessError(f"unknown advisory role: {role}")
+    root = git_root(True)
+    assert root is not None
+    p = paths(root)
+    cfg = load_config(p)
+    suffix = "-dry-run" if args.dry_run else f"-{secrets.token_hex(16)}"
+    report = p["runtime"] / f"advisory-{role}{suffix}.json"
+    prompt_file = p["runtime"] / f"advisory-{role}{suffix}-prompt.md"
+    command_file = p["runtime"] / f"advisory-{role}{suffix}-command.json"
+    log_file = p["runtime"] / f"advisory-{role}{suffix}.log"
+    evidence_file = p["runtime"] / f"advisory-{role}{suffix}-evidence.json"
+    with state_lock(p):
+        state = load_state(p)
+        worker = state.get("worker") or {}
+        if worker.get("status") in {"launching", "running"} or owner_alive(state.get("owner")):
+            raise HarnessError("advisory refused while another active worker or heavy role is running")
+        base_sha, candidate_id = candidate_identity(root, state.get("base_sha"))
+        models, efforts = runtime_role_routing(cfg["agent_runtime"])
+        model, reasoning_effort = models.get(role, ""), efforts.get(role, "")
+        prompt = render_advisory_prompt(root, p, state, role, base_sha, candidate_id)
+        atomic_runtime_write(prompt_file, prompt)
+        argv = agent_adapter_argv(cfg, root, role, prompt_file, advisory_schema_path(), report)
+        atomic_runtime_json(command_file, {
+            "argv": argv, "sandbox": "read-only", "ephemeral": True,
+            "advisory_only": True, "dry_run": bool(args.dry_run),
+            "requested_model": model, "requested_reasoning_effort": reasoning_effort,
+        })
+        if args.dry_run:
+            atomic_runtime_write(log_file, "SYNTHETIC ADVISORY OUTPUT ISOLATION CHECK\n")
+            atomic_runtime_json(report, {
+                "dry_run": True, "would_launch": argv, "advisory_only": True,
+                "base_sha": base_sha, "candidate_id": candidate_id,
+            })
+            atomic_runtime_json(evidence_file, advisory_runtime_evidence(
+                role, base_sha, candidate_id, state, model, reasoning_effort, report, root,
+                dry_run=True, status="dry_run",
+            ))
+            emit("run-advisory", "dry-run", role=role, state=state["workflow_state"],
+                 report=str(report.relative_to(root)))
+            return
+        control_before = control_artifact_snapshot(p)
+        return_code, timed_out = run_logged(
+            argv, root, log_file, int(cfg.get("worker_timeout_seconds", 3600)), worker_environment(),
+        )
+        try:
+            control_changed = control_artifact_snapshot(p) != control_before
+        except HarnessError:
+            control_changed = True
+        if control_changed:
+            restore_control_artifacts(p, control_before)
+            atomic_runtime_json(evidence_file, advisory_runtime_evidence(
+                role, base_sha, candidate_id, state, model, reasoning_effort, report, root,
+                dry_run=False, status="failed",
+                limitations=["read-only advisory changed control artifacts; restored pre-run state"],
+            ))
+            raise HarnessError("read-only advisory changed control artifacts")
+        post_base_sha, post_candidate_id = candidate_identity(root, state.get("base_sha"))
+        if post_base_sha != base_sha or post_candidate_id != candidate_id:
+            atomic_runtime_json(evidence_file, advisory_runtime_evidence(
+                role, base_sha, candidate_id, state, model, reasoning_effort, report, root,
+                dry_run=False, status="failed",
+                limitations=["read-only advisory changed the candidate"],
+            ))
+            raise HarnessError("read-only advisory changed the candidate")
+        if return_code != 0:
+            atomic_runtime_json(evidence_file, advisory_runtime_evidence(
+                role, base_sha, candidate_id, state, model, reasoning_effort, report, root,
+                dry_run=False, status="timed_out" if timed_out else "failed",
+                limitations=[f"adapter exited {return_code}"],
+            ))
+            raise HarnessError(f"{ROLE_LABELS[role]} advisory failed")
+        result = validate_report(report, advisory_schema_path())
+        if result.get("role") != ROLE_LABELS[role]:
+            raise HarnessError("advisory report role does not match the requested role")
+        if result.get("base_sha") != base_sha or result.get("candidate_id") != candidate_id:
+            raise HarnessError("advisory report candidate identity does not match the current worktree")
+        atomic_runtime_json(evidence_file, advisory_runtime_evidence(
+            role, base_sha, candidate_id, state, model, reasoning_effort, report, root,
+            dry_run=False, status=result["status"], advice=result.get("advice", []),
+            limitations=result.get("limitations", []),
+        ))
+    emit("run-advisory", "ok", role=role, state=state["workflow_state"],
+         report=str(report.relative_to(root)))
 
 
 def protected_snapshot(root: pathlib.Path, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1138,6 +1351,8 @@ adapter_argv = ["python3", "{{skill_root}}/adapters/codex_cli.py"]
 ephemeral = true
 
 [agent_runtime.models]
+
+[agent_runtime.reasoning_efforts]
 
 [language]
 internal_language = "en"

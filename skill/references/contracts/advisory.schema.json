@@ -1,0 +1,53 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "role",
+    "status",
+    "summary",
+    "advice",
+    "limitations",
+    "base_sha",
+    "candidate_id"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "enum": ["1.0"]},
+    "role": {
+      "type": "string",
+      "enum": ["Explorer", "Researcher", "Test Triage", "Log Triage"]
+    },
+    "status": {"type": "string", "enum": ["completed", "blocked"]},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "advice": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "category", "message", "evidence", "recommendation"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 128},
+          "category": {
+            "type": "string",
+            "enum": ["observation", "risk", "question", "suggestion"]
+          },
+          "message": {"type": "string", "minLength": 1, "maxLength": 4000},
+          "evidence": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {"type": "string", "minLength": 1, "maxLength": 2000}
+          },
+          "recommendation": {"type": "string", "minLength": 1, "maxLength": 4000}
+        }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"type": "string", "minLength": 1, "maxLength": 2000}
+    },
+    "base_sha": {"type": "string", "minLength": 40, "maxLength": 64},
+    "candidate_id": {"type": "string", "minLength": 77, "maxLength": 77}
+  }
+}

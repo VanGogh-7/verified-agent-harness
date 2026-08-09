@@ -10,6 +10,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
+import types
 import unittest
 from unittest import mock
 
@@ -442,6 +444,82 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn("deployment_manifest_sha256=", result.stdout)
             self.assertEqual(json.loads(manifest.read_text())["frozen_commit"], "test-frozen-commit")
             self.assertEqual(len(list((hermes / "deployment-backups").iterdir())), 1)
+        finally:
+            temp.cleanup()
+
+    def test_deployment_requires_advisory_contract_and_installed_routing_is_exact(self):
+        temp, _base, payload, hermes, _bin_dir, _group, env, _targets = self.fixture()
+        try:
+            contract = payload / "skill/references/contracts/advisory.schema.json"
+            saved_contract = contract.read_bytes()
+            contract.unlink()
+            rejected = self.deploy(payload, env)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("advisory.schema.json", rejected.stderr)
+            contract.write_bytes(saved_contract)
+
+            prompt = payload / "skill/templates/advisory-prompt.md"
+            saved_prompt = prompt.read_bytes()
+            prompt.unlink()
+            rejected = self.deploy(payload, env)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("advisory-prompt.md", rejected.stderr)
+            prompt.write_bytes(saved_prompt)
+
+            result = self.deploy(payload, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            installed = hermes / "skills/software-development/verified-agent-harness"
+            self.assertTrue((installed / "references/contracts/advisory.schema.json").is_file())
+            installed_config = tomllib.loads(
+                (payload / "projects/Group/config.toml").read_text(encoding="utf-8")
+            )
+            spec = importlib.util.spec_from_file_location(
+                "installed_codex_cli_reference", installed / "adapters/codex_cli.py"
+            )
+            assert spec is not None and spec.loader is not None
+            adapter = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(adapter)
+            expected = {
+                "Implementer": ("implementer", "workspace-write"),
+                "Correctness Reviewer": ("reviewer", "read-only"),
+                "Tester": ("tester", "read-only"),
+                "Security Reviewer": ("security_reviewer", "read-only"),
+                "Verifier": ("verifier", "read-only"),
+                "Explorer": ("explorer", "read-only"),
+                "Researcher": ("researcher", "read-only"),
+                "Test Triage": ("test_triage", "read-only"),
+                "Log Triage": ("log_triage", "read-only"),
+                "Architecture Analyst": ("architecture_analyst", "read-only"),
+                "Independent Auditor": ("auditor", "read-only"),
+                "Final Lifecycle Reviewer": ("final_lifecycle_reviewer", "read-only"),
+            }
+            with tempfile.TemporaryDirectory() as raw:
+                workdir = Path(raw)
+                prompt = workdir / "prompt.md"
+                schema = workdir / "schema.json"
+                output = workdir / "output.json"
+                prompt.write_text("prompt\n", encoding="utf-8")
+                schema.write_text("{}\n", encoding="utf-8")
+                for label, (key, access) in expected.items():
+                    model = installed_config["agent_runtime"]["models"][key]
+                    effort = installed_config["agent_runtime"]["reasoning_efforts"][key]
+                    with self.subTest(role=label), mock.patch.object(adapter.subprocess, "run") as run:
+                        adapter.sys.argv = [
+                            "codex_cli.py", "--role", label, "--access", access,
+                            "--workdir", str(workdir), "--prompt", str(prompt),
+                            "--schema", str(schema), "--output", str(output),
+                            "--model-alias", model, "--reasoning-effort", effort,
+                            "--ephemeral", "true",
+                        ]
+                        run.return_value = types.SimpleNamespace(returncode=0)
+                        self.assertEqual(adapter.main(), 0)
+                        self.assertFalse(run.call_args.kwargs.get("shell", False))
+                        self.assertEqual(run.call_args.args[0], [
+                            "codex", "exec", "--sandbox", access, "--ephemeral",
+                            "--model", model, "-c", f'model_reasoning_effort="{effort}"',
+                            "--output-schema", str(schema), "--output-last-message", str(output),
+                            "--color", "never", "-C", str(workdir), "-",
+                        ])
         finally:
             temp.cleanup()
 

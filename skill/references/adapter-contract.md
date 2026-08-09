@@ -15,15 +15,21 @@ Every adapter invocation appends these arguments in this exact order:
 --schema <absolute JSON Schema path>
 --output <absolute structured-output path>
 --model-alias <deployment alias or empty string>
+--reasoning-effort <none|low|medium|high|xhigh|max|ultra or empty string>
 --ephemeral true
 ```
 
-Canonical roles are `Implementer`, `Correctness Reviewer`, `Tester`, `Security
-Reviewer`, and `Verifier`. Only Implementer is paired with `workspace-write`;
-every other role is paired with `read-only`. An adapter must reject any other
-pairing and must create the requested output according to the supplied schema.
-The adapter receives the bounded worker environment and runs in the supplied
-workdir. It must return the underlying agent runtime exit status.
+Canonical Stage roles are `Implementer`, `Correctness Reviewer`, `Tester`,
+`Security Reviewer`, and `Verifier`. Optional non-authoritative advisory roles
+are `Explorer`, `Researcher`, `Test Triage`, and `Log Triage`; `run-advisory`
+is their only Stage command. Lifecycle labels `Architecture Analyst`,
+`Independent Auditor`, and `Final Lifecycle Reviewer` are read-only catalog
+entries only and never become Stage evidence. Only Implementer is paired with
+`workspace-write`; every other role is paired with `read-only`. An adapter must
+reject any other pairing and must create the requested output according to the
+supplied schema. It must also reject unknown reasoning values. The adapter
+receives the bounded worker environment and runs in the supplied workdir. It
+must return the underlying agent runtime exit status.
 
 The adapter is part of the trusted computing base. For `read-only`, it must map
 the request to a provider-enforced read-only sandbox or an equivalent execution
@@ -33,9 +39,12 @@ detects mutation but cannot prevent or undo it. Therefore an arbitrary executabl
 that merely accepts these arguments is not a supported adapter.
 
 For doctor compatibility, an adapter must also accept `--describe` alone and
-write one JSON object containing `{"contract_version":"1.0"}`. A replacement
-runtime is supported only after its executable implements this contract and the
-contract tests pass; command similarity or documentation claims are insufficient.
+write one secret-free JSON object containing `{"contract_version":"1.1"}` plus
+`capabilities`. Capabilities must declare structured output, ephemeral support,
+role access, and every accepted reasoning effort. A replacement runtime is
+supported only after its executable implements this non-authoritative advisory
+and routing contract and the contract tests pass; command similarity or
+documentation claims are insufficient.
 
 The portable `{skill_root}` token in configured argv elements expands to the
 absolute installed Skill root without shell evaluation. See `adapters/README.md`

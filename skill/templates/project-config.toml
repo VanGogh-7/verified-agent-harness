@@ -36,6 +36,28 @@ ephemeral = true
 # tester = "deployment-alias"
 # security_reviewer = "deployment-alias"
 # verifier = "deployment-alias"
+# explorer = "deployment-alias"
+# researcher = "deployment-alias"
+# test_triage = "deployment-alias"
+# log_triage = "deployment-alias"
+# architecture_analyst = "deployment-alias"
+# auditor = "deployment-alias"
+# final_lifecycle_reviewer = "deployment-alias"
+
+[agent_runtime.reasoning_efforts]
+# Optional per-role effort. Omit keys to let the selected adapter apply its policy.
+# implementer = "high"
+# reviewer = "high"
+# tester = "high"
+# security_reviewer = "high"
+# verifier = "high"
+# explorer = "high"
+# researcher = "high"
+# test_triage = "high"
+# log_triage = "high"
+# architecture_analyst = "high"
+# auditor = "high"
+# final_lifecycle_reviewer = "high"
 
 [language]
 internal_language = "en"

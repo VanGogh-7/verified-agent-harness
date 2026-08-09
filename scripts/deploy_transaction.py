@@ -78,6 +78,8 @@ def validate_payload(payload: Path, frozen_commit: str) -> dict:
         "skill/references/contracts/security-review.schema.json",
         "skill/references/contracts/test.schema.json",
         "skill/references/contracts/verification.schema.json",
+        "skill/references/contracts/advisory.schema.json",
+        "skill/templates/advisory-prompt.md",
         "skill/schemas/quality-gates.schema.json",
         "lifecycle-skill/SKILL.md", "lifecycle-skill/scripts/harness",
         "lifecycle-skill/schemas/analyst.schema.json",

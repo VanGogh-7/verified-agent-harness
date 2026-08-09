@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -11,7 +12,9 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import tomllib
 import types
 import unittest
 from unittest import mock
@@ -62,6 +65,7 @@ class ContractTests(unittest.TestCase):
             "--schema": "/contracts/implementation.json",
             "--output": "/work/output.json",
             "--model-alias": "writer-alias",
+            "--reasoning-effort": "",
             "--ephemeral": "true",
         })
         reviewer = H["agent_adapter_argv"](
@@ -77,6 +81,163 @@ class ContractTests(unittest.TestCase):
             )
         reference_adapter = (SKILL_ROOT / "adapters/codex_cli.py").read_text(encoding="utf-8")
         self.assertNotIn("HARNESS_CODEX_BIN", reference_adapter)
+
+    def test_runtime_role_routing_carries_reasoning_and_rejects_unknown_keys(self) -> None:
+        cfg = {
+            "agent_runtime": {
+                "adapter_argv": ["/opt/harness/adapters/reference"],
+                "ephemeral": True,
+                "models": {"explorer": "explorer-alias"},
+                "reasoning_efforts": {"explorer": "xhigh"},
+            }
+        }
+        argv = H["agent_adapter_argv"](
+            cfg, Path("/work/project"), "explorer", Path("/work/prompt.md"),
+            Path("/contracts/advisory.json"), Path("/work/output.json"),
+        )
+        values = dict(zip(argv[1::2], argv[2::2]))
+        self.assertEqual(values["--role"], "Explorer")
+        self.assertEqual(values["--access"], "read-only")
+        self.assertEqual(values["--model-alias"], "explorer-alias")
+        self.assertEqual(values["--reasoning-effort"], "xhigh")
+        for role in (
+            "implementer", "reviewer", "tester", "security_reviewer", "verifier",
+            "explorer", "researcher", "test_triage", "log_triage",
+            "architecture_analyst", "auditor", "final_lifecycle_reviewer",
+        ):
+            self.assertIn(role, H["ROLE_LABELS"])
+        for table in ("models", "reasoning_efforts"):
+            invalid = {
+                "agent_runtime": {
+                    "adapter_argv": ["/opt/harness/adapters/reference"],
+                    "ephemeral": True,
+                    table: {"unknown_role": "high"},
+                }
+            }
+            with self.assertRaisesRegex(HarnessError, "unknown role"):
+                H["agent_adapter_argv"](
+                    invalid, Path("/work/project"), "explorer", Path("/work/prompt.md"),
+                    Path("/contracts/advisory.json"), Path("/work/output.json"),
+                )
+        invalid_effort = {
+            "agent_runtime": {
+                "adapter_argv": ["/opt/harness/adapters/reference"],
+                "ephemeral": True,
+                "reasoning_efforts": {"explorer": "turbo"},
+            }
+        }
+        with self.assertRaisesRegex(HarnessError, "reasoning_efforts"):
+            H["agent_adapter_argv"](
+                invalid_effort, Path("/work/project"), "explorer", Path("/work/prompt.md"),
+                Path("/contracts/advisory.json"), Path("/work/output.json"),
+            )
+
+    def test_codex_reference_adapter_uses_exact_default_routing_argv(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "codex_cli_reference_under_test", SKILL_ROOT / "adapters" / "codex_cli.py"
+        )
+        assert spec is not None and spec.loader is not None
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        expected = {
+            "Implementer": ("workspace-write", "gpt-5.6-terra", "xhigh"),
+            "Correctness Reviewer": ("read-only", "gpt-5.6-sol", "medium"),
+            "Tester": ("read-only", "gpt-5.6-terra", "xhigh"),
+            "Security Reviewer": ("read-only", "gpt-5.6-sol", "medium"),
+            "Verifier": ("read-only", "gpt-5.6-sol", "medium"),
+            "Explorer": ("read-only", "gpt-5.6-luna", "xhigh"),
+            "Researcher": ("read-only", "gpt-5.6-terra", "xhigh"),
+            "Test Triage": ("read-only", "gpt-5.6-luna", "xhigh"),
+            "Log Triage": ("read-only", "gpt-5.6-luna", "xhigh"),
+            "Architecture Analyst": ("read-only", "gpt-5.6-terra", "xhigh"),
+            "Independent Auditor": ("read-only", "gpt-5.6-sol", "medium"),
+            "Final Lifecycle Reviewer": ("read-only", "gpt-5.6-sol", "medium"),
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            prompt = root / "prompt.md"
+            schema = root / "schema.json"
+            output = root / "output.json"
+            prompt.write_text("prompt\n", encoding="utf-8")
+            schema.write_text("{}\n", encoding="utf-8")
+            for role, (access, model, effort) in expected.items():
+                with self.subTest(role=role), mock.patch.object(adapter.subprocess, "run") as run:
+                    adapter.sys.argv = [
+                        "codex_cli.py", "--role", role, "--access", access,
+                        "--workdir", str(root), "--prompt", str(prompt),
+                        "--schema", str(schema), "--output", str(output),
+                        "--model-alias", "", "--reasoning-effort", "", "--ephemeral", "true",
+                    ]
+                    run.return_value = types.SimpleNamespace(returncode=0)
+                    self.assertEqual(adapter.main(), 0)
+                    self.assertEqual(run.call_args.kwargs["cwd"], root)
+                    self.assertFalse(run.call_args.kwargs.get("shell", False))
+                    self.assertEqual(run.call_args.args[0], [
+                        "codex", "exec", "--sandbox", access, "--ephemeral",
+                        "--model", model, "-c", f'model_reasoning_effort="{effort}"',
+                        "--output-schema", str(schema), "--output-last-message", str(output),
+                        "--color", "never", "-C", str(root), "-",
+                    ])
+
+    def test_provider_neutral_template_and_group_routing(self) -> None:
+        role_keys = (
+            "implementer", "reviewer", "tester", "security_reviewer", "verifier", "explorer",
+            "researcher", "test_triage", "log_triage", "architecture_analyst", "auditor",
+            "final_lifecycle_reviewer",
+        )
+        template = (SKILL_ROOT / "templates" / "project-config.toml").read_text(encoding="utf-8")
+        self.assertIn("[agent_runtime.reasoning_efforts]", template)
+        for role in role_keys:
+            self.assertIn(f"# {role} =", template)
+        self.assertNotIn("Terra", template)
+        self.assertNotIn("Sol", template)
+        self.assertNotIn("Luna", template)
+
+        group_config_path = SKILL_ROOT.parent / "projects" / "Group" / "config.toml"
+        if group_config_path.exists():
+            group_config = tomllib.loads(group_config_path.read_text(encoding="utf-8"))
+            expected = {
+                "implementer": ("gpt-5.6-terra", "xhigh"), "reviewer": ("gpt-5.6-sol", "medium"),
+                "tester": ("gpt-5.6-terra", "xhigh"), "security_reviewer": ("gpt-5.6-sol", "medium"),
+                "verifier": ("gpt-5.6-sol", "medium"), "explorer": ("gpt-5.6-luna", "xhigh"),
+                "researcher": ("gpt-5.6-terra", "xhigh"), "test_triage": ("gpt-5.6-luna", "xhigh"),
+                "log_triage": ("gpt-5.6-luna", "xhigh"), "architecture_analyst": ("gpt-5.6-terra", "xhigh"),
+                "auditor": ("gpt-5.6-sol", "medium"), "final_lifecycle_reviewer": ("gpt-5.6-sol", "medium"),
+            }
+            self.assertEqual(group_config["agent_runtime"]["models"],
+                             {role: value[0] for role, value in expected.items()})
+            self.assertEqual(group_config["agent_runtime"]["reasoning_efforts"],
+                             {role: value[1] for role, value in expected.items()})
+        advisory_template = (SKILL_ROOT / "templates" / "advisory-prompt.md").read_text(encoding="utf-8")
+        for boundary in ("cannot satisfy an assessment", "join the Verifier", "approve a Slice", "require repair"):
+            self.assertIn(boundary, advisory_template)
+
+    def test_routing_and_advisory_docs(self) -> None:
+        generic_docs = {
+            "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "workflow": (SKILL_ROOT / "references" / "workflow.md").read_text(encoding="utf-8"),
+            "architecture": (SKILL_ROOT / "references" / "architecture.md").read_text(encoding="utf-8"),
+            "adapter contract": (SKILL_ROOT / "references" / "adapter-contract.md").read_text(encoding="utf-8"),
+        }
+        for name, text in generic_docs.items():
+            self.assertIn("run-advisory", text, name)
+            self.assertIn("non-authoritative", text, name)
+            self.assertNotIn("Terra", text, name)
+            self.assertNotIn("Sol", text, name)
+            self.assertNotIn("Luna", text, name)
+        policy_paths = (SKILL_ROOT / "adapters" / "README.md", SKILL_ROOT.parent / "README.md")
+        for path in (path for path in policy_paths if path.exists()):
+            text = path.read_text(encoding="utf-8")
+            for phrase in ("Implementer", "Terra/xhigh", "Independent Auditor",
+                           "Sol/medium", "Final Lifecycle Reviewer"):
+                self.assertIn(phrase, text)
+        lifecycle_path = next(path for path in (
+            SKILL_ROOT.parent / "lifecycle-skill" / "SKILL.md",
+            SKILL_ROOT.parent / "project-lifecycle-harness" / "SKILL.md",
+        ) if path.exists())
+        lifecycle = lifecycle_path.read_text(encoding="utf-8")
+        for role in ("Architecture Analyst", "Independent Auditor", "Final Lifecycle Reviewer"):
+            self.assertIn(role, lifecycle)
 
     def test_core_branding_and_role_vocabulary_are_provider_neutral(self) -> None:
         self.assertIn("name: verified-agent-harness", (SKILL_ROOT / "SKILL.md").read_text())
@@ -284,6 +445,52 @@ class EnvironmentTests(unittest.TestCase):
                 H.update(originals)
         self.assertEqual(emitted[-1][1], "degraded")
         self.assertFalse(emitted[-1][2]["checks"]["agent_adapter"])
+
+    def test_doctor_requires_the_versioned_routing_adapter_capability(self) -> None:
+        emitted: list[tuple[str, str, dict[str, object]]] = []
+        role_labels = H["ROLE_LABELS"]
+        assert isinstance(role_labels, dict)
+        description = {
+            "contract_version": "1.1",
+            "capabilities": {
+                "structured_output": True,
+                "ephemeral": True,
+                "role_access": {label: ("workspace-write" if key == "implementer" else "read-only")
+                                for key, label in H["ROLE_LABELS"].items()},
+                "reasoning_efforts": ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
+            },
+        }
+        incomplete = json.loads(json.dumps(description))
+        incomplete["capabilities"]["role_access"] = {"Implementer": "workspace-write"}
+        replacements = {
+            "git_root": lambda _required: Path("/project"),
+            "paths": lambda _root: {"config": SKILL_ROOT / "templates" / "project-config.toml"},
+            "load_config": lambda _paths: {"harness_version": H["HARNESS_VERSION"]},
+            "expanded_adapter_argv": lambda _cfg: ["adapter"],
+            "run_capture": lambda *_args, **_kwargs: types.SimpleNamespace(
+                returncode=0, stdout=json.dumps(description),
+            ),
+            "executable_version": lambda _executable, _args: (True, "available"),
+            "emit": lambda command, status, **values: emitted.append((command, status, values)),
+        }
+        originals = {name: H[name] for name in replacements}
+        doctor = H["doctor"]
+        harness_error = H["HarnessError"]
+        assert callable(doctor) and isinstance(harness_error, type)
+        H.update(replacements)
+        try:
+            H["run_capture"] = lambda *_args, **_kwargs: types.SimpleNamespace(
+                returncode=0, stdout=json.dumps(incomplete),
+            )
+            with self.assertRaises(harness_error):
+                doctor(argparse.Namespace(capabilities=False))
+            self.assertEqual(emitted[-1][1], "degraded")
+            H["run_capture"] = replacements["run_capture"]
+            doctor(argparse.Namespace(capabilities=False))
+        finally:
+            H.update(originals)
+        self.assertEqual(emitted[-1][1], "ok")
+        self.assertTrue(emitted[-1][2]["checks"]["agent_adapter"])
 
     def test_gate_executable_is_resolved_and_reportable(self) -> None:
         with mock.patch.object(H["shutil"], "which", return_value="/usr/bin/true"):
@@ -699,6 +906,100 @@ class StateAndSnapshotTests(unittest.TestCase):
         self.assertEqual(state["required_assessments"],
                          ["reviewer", "tester", "security_reviewer"])
 
+    def test_generic_advisory_is_bound_read_only_and_non_authoritative(self) -> None:
+        run_advisory = H["run_advisory"]
+        load_state = H["load_state"]
+        harness_error = H["HarnessError"]
+        assert callable(run_advisory) and callable(load_state) and isinstance(harness_error, type)
+        with tempfile.TemporaryDirectory() as raw:
+            adapter = Path(raw) / "advisory_adapter.py"
+            adapter.write_text(
+                """import argparse
+import json
+from pathlib import Path
+import re
+
+parser = argparse.ArgumentParser()
+for name in (\"role\", \"access\", \"workdir\", \"prompt\", \"schema\", \"output\", \"model-alias\", \"reasoning-effort\", \"ephemeral\"):
+    parser.add_argument(f\"--{name}\", required=True)
+args = parser.parse_args()
+prompt = Path(args.prompt).read_text(encoding=\"utf-8\")
+base = re.search(r\"^Base SHA: (.+)$\", prompt, re.MULTILINE).group(1)
+candidate = re.search(r\"^Candidate ID: (.+)$\", prompt, re.MULTILINE).group(1)
+if args.role == \"Researcher\":
+    Path(args.workdir, \"advisory-mutation.txt\").write_text(\"unexpected\\n\", encoding=\"utf-8\")
+if args.role == \"Log Triage\":
+    state_path = Path(args.workdir, \".git/harness-control/state.json\")
+    state = json.loads(state_path.read_text(encoding=\"utf-8\"))
+    state[\"attempt\"] = 999
+    state_path.write_text(json.dumps(state), encoding=\"utf-8\")
+Path(args.output).write_text(json.dumps({
+    \"schema_version\": \"1.0\", \"role\": args.role, \"status\": \"completed\",
+    \"summary\": \"bounded advice\", \"advice\": [{
+        \"id\": \"ADV-1\", \"category\": \"observation\", \"message\": \"inspect status\",
+        \"evidence\": [\"git status\"], \"recommendation\": \"consider the observation\"
+    }], \"limitations\": [], \"base_sha\": base, \"candidate_id\": candidate
+}), encoding=\"utf-8\")
+""",
+                encoding="utf-8",
+            )
+            temp, root, paths = self.make_harness_repo(
+                json.dumps([sys.executable, str(adapter)])
+            )
+            self.addCleanup(temp.cleanup)
+            for config_path in (paths["config"], paths["trusted_config"]):
+                text = config_path.read_text(encoding="utf-8")
+                text = text.replace(
+                    "[agent_runtime.models]\n\n[agent_runtime.reasoning_efforts]\n",
+                    "[agent_runtime.models]\nexplorer = \"explorer-alias\"\n\n"
+                    "[agent_runtime.reasoning_efforts]\nexplorer = \"high\"\n",
+                )
+                config_path.write_text(text, encoding="utf-8")
+            before = json.loads(json.dumps(H["load_state"](paths)))
+            with contextlib.chdir(root), contextlib.redirect_stdout(io.StringIO()):
+                H["run_advisory"](argparse.Namespace(role="explorer", dry_run=False))
+            after = H["load_state"](paths)
+            self.assertEqual(after, before)
+            self.assertEqual(after["completed_assessments"], [])
+            self.assertEqual(after["verifier_state"], "pending")
+            self.assertFalse(any(paths[name].exists() for name in (
+                "trusted_implementation", "trusted_review", "trusted_test",
+                "trusted_security_review", "trusted_verification",
+            )))
+            evidence_path, = paths["runtime"].glob("advisory-explorer-*-evidence.json")
+            evidence = H["load_json"](evidence_path)
+            self.assertTrue(evidence["advisory_only"])
+            self.assertEqual(evidence["role"], "explorer")
+            self.assertEqual(evidence["access"], "read-only")
+            self.assertEqual(evidence["requested_model"], "explorer-alias")
+            self.assertEqual(evidence["requested_reasoning_effort"], "high")
+            base_sha, candidate_id = H["candidate_identity"](root, after["base_sha"])
+            self.assertEqual(evidence["base_sha"], base_sha)
+            self.assertEqual(evidence["candidate_id"], candidate_id)
+            command_path, = paths["runtime"].glob("advisory-explorer-*-command.json")
+            command = H["load_json"](command_path)
+            self.assertIn("--reasoning-effort", command["argv"])
+            self.assertEqual(command["sandbox"], "read-only")
+
+            with contextlib.chdir(root), self.assertRaisesRegex(
+                harness_error, "changed the candidate"
+            ):
+                run_advisory(argparse.Namespace(role="researcher", dry_run=False))
+
+            root.joinpath("advisory-mutation.txt").unlink()
+            trusted_before = load_state(paths)
+            with contextlib.chdir(root), self.assertRaisesRegex(
+                harness_error, "control artifacts"
+            ):
+                run_advisory(argparse.Namespace(role="log_triage", dry_run=False))
+            self.assertEqual(load_state(paths), trusted_before)
+
+            active = H["load_state"](paths)
+            active["worker"] = {"role": "tester", "status": "running"}
+            H["save_state"](paths, active)
+            with contextlib.chdir(root), self.assertRaisesRegex(HarnessError, "active worker"):
+                H["run_advisory"](argparse.Namespace(role="explorer", dry_run=True))
+
     def test_all_role_dry_runs_preserve_business_state(self) -> None:
         temp, root, paths = self.make_harness_repo()
         self.addCleanup(temp.cleanup)
@@ -709,6 +1010,9 @@ class StateAndSnapshotTests(unittest.TestCase):
         self.assertEqual(H["load_state"](paths), before)
         for role in ("implementer", "reviewer", "tester", "security_reviewer", "verifier"):
             self.assertFalse(paths["trusted"] .joinpath(H["REPORT_FILES"][role]).exists())
+            command = H["load_json"](paths["runtime"] / f"{role}-dry-run-command.json")
+            self.assertIn("requested_model", command)
+            self.assertIn("requested_reasoning_effort", command)
 
     def test_state_machine_docs_match_recovery_edge(self) -> None:
         self.assertNotIn("VALIDATING", H["TRANSITIONS"]["CHANGES_REQUIRED"])

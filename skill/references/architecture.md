@@ -10,8 +10,8 @@ Git HEAD is the stable base. A candidate may be uncommitted; `candidate_id` bind
 
 ## Evidence
 
-Implementer, deterministic gates, every policy-required assessor, and Verifier produce strict revision-bound JSON. Runtime files are diagnostic mirrors. Approval reads canonical evidence and recomputes current identity.
+Implementer, deterministic gates, every policy-required assessor, and Verifier produce strict revision-bound JSON. Runtime files are diagnostic mirrors. Approval reads canonical evidence and recomputes current identity. `run-advisory` produces non-authoritative runtime records only: Explorer, Researcher, Test Triage, and Log Triage cannot satisfy an assessment, enter the Verifier join, approve, or force repair.
 
 ## Ephemeral reasoning
 
-Prompts, worker logs, assessor reasoning, notifications, and optional Kanban descriptions may help produce evidence but never approve work. They are replaceable and may be compressed or discarded according to recovery policy.
+Prompts, worker logs, assessor reasoning, non-authoritative advisory output, notifications, and optional Kanban descriptions may help produce evidence but never approve work. Advisory output can be candidate-bound for current-context usefulness, but it is never copied to canonical evidence. These materials are replaceable and may be compressed or discarded according to recovery policy.
