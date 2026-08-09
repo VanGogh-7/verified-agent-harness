@@ -27,7 +27,7 @@ def updated_config(config):
 
 
 def main() -> int:
-    root = Path(os.environ.get("HERMES_DEPLOY_HOME", "/home/van-gogh/.hermes"))
+    root = Path(os.environ.get("HERMES_DEPLOY_HOME", str(Path.home() / ".hermes")))
     config_path = root / "config.yaml"
     if config_path.is_symlink() or not config_path.is_file():
         raise SystemExit("configure-hermes refused: config.yaml is missing or symlinked")

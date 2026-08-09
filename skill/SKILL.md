@@ -1,71 +1,98 @@
 ---
-name: codex-harness
-description: Use when orchestrating staged Hermes + Codex engineering.
-version: 0.5.0
-author: Hermes Agent
+name: verified-agent-harness
+description: Classify and execute trusted-local, evidence-bound engineering workflows through a provider-neutral agent adapter.
+version: 1.0.0
+author: verified-agent-harness contributors
 license: MIT
 platforms: [linux]
-metadata:
-  hermes:
-    tags: [codex, harness, orchestration, review, quality-gates]
-    related_skills: [codex, hermes-agent]
 ---
 
-# Codex Harness Engineering
+# verified-agent-harness 1.0
 
-## Role
+## Purpose
 
-Act as Lead Engineer and Orchestrator. Codex A implements with `workspace-write`; independent Codex B reviews with `read-only`; configured formatter/lint/check/test commands are deterministic gates. Git owns history. `.harness/` exposes current project state and replaceable runtime handoffs; the active control-plane copy lives under Git metadata (`.git/harness-control/`), outside Codex's writable sandbox.
+Act as the Orchestrator for a trusted-local engineering workflow. The inner Harness enforces:
 
-## Mandatory protocol
+```text
+one writer -> deterministic gates -> independent read-only assessors -> independent verifier -> approval
+```
 
-The sibling global Skill `project-lifecycle-harness` owns greenfield bootstrap, brownfield adoption, compatibility migration, and the transition to `HARNESS_READY`. Use this Skill's Stage/Slice engine only for a compatible Harness after lifecycle routing, or for the lifecycle Skill's explicitly approved baseline Stage.
+Git HEAD plus a credential-safe worktree fingerprint forms `candidate_id`. A new candidate invalidates every old gate, assessor, and Verifier report. Slice candidates may remain uncommitted; commits remain a Stage-level policy.
 
-1. Discuss direction, architecture, Stages, Slices, acceptance criteria, and hard exclusions with the user. Do not launch Codex before explicit approval.
-2. Run `harness init` once. Before every action, read only `.harness/state.json` (or `harness status`) and the relevant current-state document.
-3. Record approval with `harness start-stage --stage ... --title ... --slice ... --plan-file ...`. The command validates transitions and updates `CURRENT_STAGE.md`.
-4. Invoke Codex only through `harness run-implementer` or `harness run-reviewer`. Never call `codex exec` directly.
-5. Launch long worker commands with Hermes `terminal(background=true, notify_on_complete=true)`. The launch must return a background session identifier quickly. Do not run long Codex work in a foreground tool call and do not call `process(log)`.
-6. While a worker runs, trust `harness status` (backed by the canonical Git-metadata checkpoint) and the completion notification only as wake-up signals. Business results come from validated canonical evidence; never read full worker logs by default.
-7. After Implementer handoff, run `harness run-gates --level fast|slice|stage` as required. Launch Reviewer only after gates pass. Approve a Slice only when both `quality-gates.json` and `review.json` pass.
-8. Limit each Slice to three A/B correction attempts (or the lower configured cap). On exhaustion, stop at `HUMAN_CHECKPOINT`.
-9. At Stage completion, update `PROJECT_STATE.md`, run `harness approve-slice --complete-stage`, and let the CLI clear replaceable runtime files. Commit only when the project/user policy authorizes it.
+## Classify first
 
-## Language boundary
+- `FAST`: trivial, localized, low-risk work. Use one writer and direct deterministic checks; do not initialize the Stage engine solely for FAST work.
+- `VERIFIED`: default for nontrivial work. Use Implementer, gates, Correctness Reviewer, Tester, Verifier.
+- `SECURITY`: VERIFIED plus Security Reviewer. Select it with `start-stage --workflow SECURITY`; it cannot be toggled during an active Stage.
+- `DAG`: genuinely independent writers use isolated worktrees and optional outer coordination. Each candidate still passes this inner verified gate before integration.
+- `LONG_RUNNING`: use durable Kanban tasks, event-driven waiting, and explicit completion contracts around the same inner gate.
 
-Detect the operator's language from the active conversation and use it only for operator-facing discussion, progress, approval, checkpoint, and completion messages. Never persist that detected language as a project or user preference, never proactively correct the operator's grammar, and reassess it in each new conversation.
+Kanban is an optional outer durable DAG. Its flexible metadata is never a trusted approval boundary and does not replace `.git/harness-control/`.
 
-All Agent-to-Agent prompts and reports, machine state, schemas, gate reports, engineering documentation, plans, source comments, paths, names, identifiers, tests, configuration, Stage/Slice titles, Git messages, CI names, and templates are English. Convert approved non-English requirements into precise English artifacts without changing their meaning. Do not translate or rename paths, commands, code/API identifiers, Stage/Slice IDs, state values, Git references, package names, JSON keys, or error codes. Product localization is separate: localized product strings may use required locales, while localization keys and engineering artifacts remain English.
+## Authority
 
-This release is deliberately **trusted-local**, not a hostile-repository sandbox.
-Project code, worker commands, and quality gates still execute as the current Unix
-user. Harness uses a fresh process group, Linux child-subreaper tracking, bounded
-timeouts, and optional cgroup v2 cleanup to reclaim descendants. It does not
-require user namespaces or `unshare`, and it does not claim to contain arbitrary
-malicious repositories. Harness copies validated implementation/gate/review
-evidence into `.git/harness-control/` and never approves from mutable runtime
-reports.
+- Implementer is the only writer. It may edit only the approved worktree scope.
+- Gates execute configured deterministic commands without a shell.
+- Correctness Reviewer, Tester, optional Security Reviewer, and Verifier are policy read-only. The configured trusted adapter must enforce that access mode; the core independently rejects their evidence if the candidate changed, but does not provide kernel-level containment for an arbitrary adapter.
+- Assessor findings are hypotheses. Assessors cannot approve or force repair.
+- Verifier classifies each finding as `confirmed`, `rejected`, `inconclusive`, or `flaky_or_infra`.
+- Only confirmed policy-blocking findings cause `CHANGES_REQUIRED`. Policy-blocking inconclusive or `flaky_or_infra` evidence fails closed to `BLOCKED`; rejected findings do not cause repair.
+- The Orchestrator alone starts Stages, runs gates, accepts approval, changes policy between Stages, and owns external coordination.
 
-Gates receive a temporary `HOME` and a fixed environment allowlist. `CODEX_HOME`,
-`HERMES_HOME`, credential variables, and proxy variables are absent by default.
-Worker, Reviewer, and Gate logs are always fresh single-link owner-owned regular
-files; output redaction withholds incomplete lines so split secrets are not
-partially emitted.
+All roles deny secrets and network authority by default. No role may merge, commit, push, publish, tag, release, or alter protected control files unless a separately approved project policy grants the specific action. No outbound telemetry exists; concise local evidence counters are allowed.
 
-## Context maintenance during worker idle time
+## Protocol
 
-After the background launch returns, ensure Stage/Slice/attempt/next action are durable. Then call `harness_context_status` if available. Compression is allowed only when all safety conditions in `references/recovery.md` hold.
+1. Obtain explicit scope and acceptance approval. When lifecycle routing is required, use the repository-installed `bin/harness` router; this Stage Skill intentionally exposes no `detect`, `assess`, `bootstrap`, `adopt`, or `activate` command.
+2. `harness init`, then `harness start-stage --workflow VERIFIED|SECURITY ...`.
+3. Run Implementer. It records schema version, attempt, `base_sha`, final `candidate_id`, changed files, command results, decisions, limitations, residual risk, and blockers.
+4. Run deterministic gates. Slice or Stage gates bind their evidence to the same candidate.
+5. Run required assessors. Logical fan-out may execute serially whenever host resources do not safely allow concurrency.
+6. Run Verifier only after every required assessor report exists.
+7. Run `approve-slice` only after Verifier approval. Approval revalidates all canonical reports, candidate identity, protected baseline, Git HEAD, and current worktree.
 
-Hermes 0.19.1 has canonical automatic and `/compress` paths but no public plugin API that safely compacts the active conversation after an agent tool call returns. The companion plugin therefore reports occupancy and returns an explicit `manual_required`/automatic-fallback result; it never claims compaction succeeded. If threshold is reached, preserve the checkpoint, finish the current tool turn, use the canonical `/compress` command when the surface permits, then re-read state, checkpoint, and `CURRENT_STAGE.md`. Never compress while a Hermes tool call is outstanding.
+Use the configured agent runtime adapter for real workers, bind any external session to the active generation, and treat notifications only as wakeups. Read canonical state again after every wakeup. Dry runs produce only runtime artifacts and never mutate business state or satisfy approval.
 
-## Read-on-demand map
+## Candidate and evidence policy
 
-- Full A/B workflow and command recipes: `references/workflow.md`
-- Legal states and transitions: `references/state-machine.md`
-- Recovery, race handling, checkpoint, and compression safety: `references/recovery.md`
-- Handoff contracts: `schemas/*.schema.json`
-- Prompt/project starting points: `templates/`
+`harness candidate-id --json` returns the current identity. The identity is derived from `candidate-v1`, the Stage baseline `base_sha`, and exact changed worktree content. Credential-shaped files contribute metadata only; their contents are never read. All role reports repeat attempt, base, and candidate. Mismatch fails closed for assessors, Verifier, and approval.
 
-## Completion check
+Canonical state and validated evidence live under `.git/harness-control/`. Project-facing `.harness/state.json` and runtime reports are mirrors. The protected baseline binds Git HEAD, stable Git configuration, and configured protected files. State uses atomic replace, fsync, a lock, and revision checks.
 
-Do not report completion until the structured handoffs validate, deterministic gates pass, independent review passes, the final Git diff is scoped, and all skipped checks and residual risks are stated.
+Retain source-system JSON or raw logs for external claims, plus revision identity and integrity evidence. Plan prose is not evidence. No hosted CI, app-server, A2A, MCP, publication provider, or distributed scheduler is implemented by this Skill.
+
+## Repair and resource policy
+
+The default budget is the initial candidate plus two repair rounds (`max_slice_attempts = 3`). Only a positively classified adapter spawn/exec or structured-output startup rejection before business work, with an unchanged worktree, releases a tentative Implementer attempt. Classification fails closed: timeouts, ordinary nonzero exits, worktree changes, invalid or missing handoffs, and runtime-integrity failures remain charged. A confirmed blocker consumes the next Implementer round; exhaustion enters `HUMAN_CHECKPOINT`.
+
+Never overlap a live Worker or Reviewer with another heavy process; the same rule covers Tester, Security Reviewer, Verifier, builds, tests, benchmarks, and packaging. Check RAM, swap trend, GPU headroom when relevant, and live agent descendants before launch. `CARGO_BUILD_JOBS=4` is the default cap. Logical assessor fan-out may be serial.
+
+Worker generation, Stage, Slice, attempt, candidate, owner/worker identities, session, and checkpoint epoch are recovery bindings. Stale evidence is rejected for every role. See `references/recovery.md`.
+
+## Compatibility and migration
+
+Version 1.0.0 does not mutate an active 0.4.0 Stage. Existing active Stages fail closed and must finish with the installed 0.4.0 Skill or be explicitly abandoned by the operator. Migrate only between Stages: back up control artifacts, install 1.0.0, review and merge the new config keys, run `harness doctor`, review state/config together, and start the next Stage so the new baseline is captured. User files and existing Git history are preserved. `config_version` remains 1; unknown versions fail closed.
+
+Mandatory model names from the research report are not adopted because product labels and availability drift. Optional per-role model routing accepts deployment aliases in `[agent_runtime.models]`; omission uses the configured runtime default. Legacy `[codex]` configuration is rejected during active work and may be migrated explicitly only between Stages. Commit-per-Slice is not adopted because exact candidate identity provides revision binding while preserving Stage-level commit policy.
+
+## Read on demand
+
+- Command order and Kanban boundary: `references/workflow.md`
+- Executable states and transitions: `references/state-machine.md`
+- Recovery and invalidation: `references/recovery.md`
+- Control/source/evidence/reasoning layers: `references/architecture.md`
+- Agent handoff contracts: `references/contracts/*.schema.json`
+- Executable runtime contract: `references/adapter-contract.md`
+- Gate contract: `schemas/quality-gates.schema.json`
+
+## Verification
+
+Run:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_harness.py
+scripts/harness --version
+scripts/harness doctor
+```
+
+For workflow changes, exercise `init`, `start-stage`, and every worker role with `--dry-run` in a disposable committed repository. No `__pycache__` may remain.

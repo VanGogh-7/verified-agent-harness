@@ -1,13 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://local.hermes/schemas/codex-harness/quality-gates.schema.json",
+  "$id": "https://verified-agent-harness.invalid/schemas/quality-gates.schema.json",
   "title": "Deterministic quality-gate report",
   "type": "object",
   "additionalProperties": false,
-  "required": ["status", "level", "gates", "completed_at"],
+  "required": ["schema_version", "status", "level", "base_sha", "candidate_id", "gates", "completed_at"],
   "properties": {
+    "schema_version": {"type": "string", "enum": ["1.0"]},
+    "base_sha": {"type": "string", "minLength": 40, "maxLength": 64},
+    "candidate_id": {"type": "string", "minLength": 77, "maxLength": 77},
     "status": {"type": "string", "enum": ["passed", "failed"]},
     "level": {"type": "string", "enum": ["fast", "slice", "stage"]},
+    "failure_class": {"type": "string", "enum": ["none", "product"]},
     "completed_at": {"type": "string", "maxLength": 128},
     "gates": {
       "type": "array",
@@ -16,12 +20,14 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "status", "command"],
+        "required": ["name", "status", "command", "resolved_command", "exit_code", "log"],
         "properties": {
           "name": {"type": "string", "maxLength": 128},
           "status": {"type": "string", "enum": ["passed", "failed", "skipped"]},
-          "command": {"type": "array", "maxItems": 128, "items": {"type": "string", "maxLength": 4096}},
+          "command": {"type": "array", "minItems": 1, "maxItems": 128, "items": {"type": "string", "maxLength": 4096}},
+          "resolved_command": {"type": "array", "minItems": 1, "maxItems": 128, "items": {"type": "string", "maxLength": 4096}},
           "exit_code": {"type": "integer"},
+          "timed_out": {"type": "boolean"},
           "log": {"type": "string", "maxLength": 1024}
         }
       }

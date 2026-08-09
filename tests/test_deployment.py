@@ -5,10 +5,12 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,16 +20,24 @@ import importlib.util
 deploy_spec = importlib.util.spec_from_file_location("deploy_transaction", DEPLOY)
 deploy_module = importlib.util.module_from_spec(deploy_spec)
 deploy_spec.loader.exec_module(deploy_module)
-PHASES = deploy_module.PHASES
+PRE_COMMIT_PHASES = deploy_module.PRE_COMMIT_PHASES
 
 
 def snapshot(path: Path):
-    if not path.exists() and not path.is_symlink():
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
         return None
-    if path.is_file() or path.is_symlink():
-        return ("file", path.read_bytes(), path.stat().st_mode & 0o777)
-    return ("dir", {str(item.relative_to(path)): (item.read_bytes(), item.stat().st_mode & 0o777)
-                    for item in sorted(candidate for candidate in path.rglob("*") if candidate.is_file())})
+    mode = stat.S_IMODE(metadata.st_mode)
+    if stat.S_ISLNK(metadata.st_mode):
+        return ("symlink", os.readlink(path), mode)
+    if stat.S_ISREG(metadata.st_mode):
+        return ("file", path.read_bytes(), mode)
+    if stat.S_ISDIR(metadata.st_mode):
+        return ("dir", mode, tuple(
+            (child.name, snapshot(child)) for child in sorted(path.iterdir(), key=lambda item: item.name)
+        ))
+    return ("other", metadata.st_mode)
 
 
 class DeploymentTests(unittest.TestCase):
@@ -55,10 +65,13 @@ class DeploymentTests(unittest.TestCase):
                "HARNESS_BIN_DIR": str(bin_dir), "GROUP_PROJECT_ROOT": str(group)}
         targets = (
             hermes / "skills/software-development/codex-harness",
+            hermes / "skills/software-development/verified-agent-harness",
             hermes / "skills/software-development/project-lifecycle-harness",
-            hermes / "plugins/codex-harness-context", bin_dir / "harness",
+            hermes / "plugins/codex-harness-context",
+            hermes / "plugins/verified-agent-harness-context", bin_dir / "harness",
             group / ".harness/config.toml", hermes / "config.yaml",
             hermes / "codex-harness-deployment-manifest.json",
+            hermes / "verified-agent-harness-deployment-manifest.json",
         )
         return temp, base, payload, hermes, bin_dir, group, env, targets
 
@@ -73,7 +86,7 @@ class DeploymentTests(unittest.TestCase):
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def test_fault_at_each_deployment_phase_restores_byte_identical_targets(self):
-        for phase in PHASES:
+        for phase in PRE_COMMIT_PHASES:
             temp, _base, payload, hermes, _bin_dir, _group, env, targets = self.fixture()
             try:
                 before = [snapshot(path) for path in targets]
@@ -84,6 +97,280 @@ class DeploymentTests(unittest.TestCase):
             finally:
                 temp.cleanup()
 
+    def test_fault_before_and_after_backup_rename_restores_all_targets(self):
+        phases = (
+            "backup_legacy_skill_before_rename",
+            "backup_legacy_skill_rename_error_before_move",
+            "backup_legacy_skill_rename_error_after_move",
+            "backup_legacy_skill_after_rename",
+            "backup_launcher_before_rename",
+            "backup_launcher_rename_error_before_move",
+            "backup_launcher_rename_error_after_move",
+            "backup_launcher_after_rename",
+        )
+        for phase in phases:
+            temp, _base, payload, hermes, _bin_dir, _group, env, targets = self.fixture()
+            try:
+                before = [snapshot(path) for path in targets]
+                result = self.deploy(payload, env, fault=phase)
+                self.assertNotEqual(result.returncode, 0, phase)
+                self.assertEqual(before, [snapshot(path) for path in targets], phase)
+                self.assertFalse((hermes / "deployment-backups").exists(), phase)
+            finally:
+                temp.cleanup()
+
+    def test_existing_deployment_target_symlink_is_rejected_before_mutation(self):
+        temp, base, payload, hermes, bin_dir, _group, env, targets = self.fixture()
+        try:
+            launcher = bin_dir / "harness"
+            launcher.unlink()
+            referent = base / "outside-launcher"
+            referent.write_bytes(b"outside launcher\n")
+            launcher.symlink_to(referent)
+            before = [snapshot(path) for path in targets]
+
+            result = self.deploy(payload, env)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("deployment target is symlinked", result.stderr)
+            self.assertEqual(before, [snapshot(path) for path in targets])
+            self.assertEqual(referent.read_bytes(), b"outside launcher\n")
+            self.assertFalse((hermes / "deployment-backups").exists())
+        finally:
+            temp.cleanup()
+
+    def test_cleanup_failure_after_commit_retains_archive_and_installed_targets(self):
+        temp, _base, payload, hermes, _bin_dir, _group, env, targets = self.fixture()
+        try:
+            before = [snapshot(path) for path in targets]
+            result = self.deploy(payload, env, fault="temporary_backup_cleanup")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual(before, [snapshot(path) for path in targets])
+            archives = list((hermes / "deployment-backups").iterdir())
+            self.assertEqual(len(archives), 1)
+            self.assertIn("temporary backup cleanup incomplete", result.stderr)
+        finally:
+            temp.cleanup()
+
+    def test_retained_archive_preserves_nested_symlink_identity(self):
+        temp, base, payload, hermes, _bin_dir, _group, env, _targets = self.fixture()
+        try:
+            old_skill = hermes / "skills/software-development/codex-harness"
+            referent = base / "outside-old-skill"
+            referent.write_text("outside bytes\n", encoding="utf-8")
+            (old_skill / "nested-link").symlink_to(referent)
+            expected = snapshot(old_skill)
+
+            result = self.deploy(payload, env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            archives = list((hermes / "deployment-backups").iterdir())
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(snapshot(archives[0] / "legacy_skill"), expected)
+            self.assertEqual(referent.read_text(encoding="utf-8"), "outside bytes\n")
+        finally:
+            temp.cleanup()
+
+    def test_rollback_preserves_unrecognized_target_and_backup(self):
+        temp, base, payload, hermes, bin_dir, _group, env, _targets = self.fixture()
+        try:
+            launcher = bin_dir / "harness"
+            original = launcher.read_bytes()
+            moved = base / "transaction-launcher"
+            sentinel = b"unrelated concurrent launcher\n"
+            doctor = [
+                sys.executable,
+                "-c",
+                (
+                    "import os, pathlib; "
+                    f"p=pathlib.Path({str(launcher)!r}); "
+                    f"os.replace(p, pathlib.Path({str(moved)!r})); "
+                    f"p.write_bytes({sentinel!r}); "
+                    "raise SystemExit(1)"
+                ),
+            ]
+
+            result = self.deploy(payload, env, doctor=doctor)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unrecognized target preserved", result.stderr)
+            self.assertEqual(launcher.read_bytes(), sentinel)
+            backups = list(bin_dir.glob(".harness.backup-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), original)
+        finally:
+            temp.cleanup()
+
+    def test_rollback_preserves_distinct_same_content_replacement_and_backup(self):
+        temp, base, payload, _hermes, bin_dir, _group, env, _targets = self.fixture()
+        try:
+            launcher = bin_dir / "harness"
+            original = launcher.read_bytes()
+            replacement = (payload / "bin/harness").read_bytes()
+            moved = base / "transaction-launcher"
+            doctor = [
+                sys.executable,
+                "-c",
+                (
+                    "import os, pathlib, stat; "
+                    f"p=pathlib.Path({str(launcher)!r}); "
+                    "data=p.read_bytes(); mode=stat.S_IMODE(p.stat().st_mode); "
+                    f"os.replace(p, pathlib.Path({str(moved)!r})); "
+                    "p.write_bytes(data); os.chmod(p, mode); "
+                    "raise SystemExit(1)"
+                ),
+            ]
+
+            result = self.deploy(payload, env, doctor=doctor)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unrecognized target preserved", result.stderr)
+            self.assertEqual(launcher.read_bytes(), replacement)
+            backups = list(bin_dir.glob(".harness.backup-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), original)
+        finally:
+            temp.cleanup()
+
+    def test_quarantine_detects_replacement_between_token_check_and_rename(self):
+        with tempfile.TemporaryDirectory(prefix="deployment-quarantine-") as raw:
+            base = Path(raw)
+            target = base / "target"
+            quarantine = base / "quarantine"
+            moved = base / "transaction-object"
+            target.write_bytes(b"same payload\n")
+            expected = deploy_module.object_token(target)
+            real_replace = os.replace
+
+            def race(source, destination):
+                if Path(source) == target:
+                    real_replace(target, moved)
+                    target.write_bytes(b"same payload\n")
+                return real_replace(source, destination)
+
+            with mock.patch.object(deploy_module.os, "replace", side_effect=race):
+                status = deploy_module.quarantine_owned_target(target, expected, quarantine)
+
+            self.assertEqual(status, "unrecognized_quarantined")
+            self.assertFalse(target.exists())
+            self.assertEqual(quarantine.read_bytes(), b"same payload\n")
+            self.assertEqual(moved.read_bytes(), b"same payload\n")
+
+    def test_rename_noreplace_preserves_concurrent_destination(self):
+        with tempfile.TemporaryDirectory(prefix="deployment-restore-") as raw:
+            base = Path(raw)
+            backup = base / "backup"
+            target = base / "target"
+            backup.write_bytes(b"verified prior object\n")
+            target.write_bytes(b"concurrent external object\n")
+
+            with self.assertRaises(OSError) as raised:
+                deploy_module.rename_noreplace(backup, target)
+
+            self.assertEqual(raised.exception.errno, deploy_module.errno.EEXIST)
+            self.assertEqual(backup.read_bytes(), b"verified prior object\n")
+            self.assertEqual(target.read_bytes(), b"concurrent external object\n")
+
+    def test_successful_rollback_retains_owned_quarantine_for_prior_target(self):
+        temp, _base, payload, _hermes, bin_dir, _group, env, _targets = self.fixture()
+        try:
+            launcher = bin_dir / "harness"
+            original = launcher.read_bytes()
+            staged = (payload / "bin/harness").read_bytes()
+            result = self.deploy(payload, env, doctor=[sys.executable, "-c", "raise SystemExit(1)"])
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(launcher.read_bytes(), original)
+            quarantines = list(bin_dir.glob(".harness.rollback-*"))
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(quarantines[0].read_bytes(), staged)
+            self.assertIn(str(quarantines[0]), result.stderr)
+        finally:
+            temp.cleanup()
+
+    def test_successful_rollback_retains_owned_quarantine_for_absent_target(self):
+        temp, _base, payload, hermes, _bin_dir, _group, env, _targets = self.fixture()
+        try:
+            manifest = hermes / "verified-agent-harness-deployment-manifest.json"
+            manifest.unlink(missing_ok=True)
+            staged = json.dumps(
+                deploy_module.payload_manifest(payload, "test-frozen-commit"),
+                indent=2, sort_keys=True,
+            ).encode("utf-8") + b"\n"
+            result = self.deploy(payload, env, doctor=[sys.executable, "-c", "raise SystemExit(1)"])
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(manifest.exists())
+            quarantines = list(hermes.glob(".verified-agent-harness-deployment-manifest.json.rollback-*"))
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(quarantines[0].read_bytes(), staged)
+            self.assertIn(str(quarantines[0]), result.stderr)
+        finally:
+            temp.cleanup()
+
+    def test_absent_target_rollback_removes_in_place_mutated_staged_object(self):
+        temp, _base, payload, hermes, _bin_dir, _group, env, _targets = self.fixture()
+        try:
+            manifest = hermes / "verified-agent-harness-deployment-manifest.json"
+            manifest.unlink(missing_ok=True)
+            doctor = [
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(manifest)!r}).write_text('mutated in place') ; raise SystemExit(1)",
+            ]
+
+            result = self.deploy(payload, env, doctor=doctor)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(manifest.exists(), result.stderr)
+        finally:
+            temp.cleanup()
+
+    def test_absent_target_rollback_preserves_atomically_replaced_unrelated_object(self):
+        temp, base, payload, hermes, _bin_dir, _group, env, _targets = self.fixture()
+        try:
+            manifest = hermes / "verified-agent-harness-deployment-manifest.json"
+            manifest.unlink(missing_ok=True)
+            replacement = base / "unrelated-manifest"
+            sentinel = b"unrelated concurrent manifest\n"
+            replacement.write_bytes(sentinel)
+            doctor = [
+                sys.executable,
+                "-c",
+                f"import os; os.replace({str(replacement)!r}, {str(manifest)!r}); raise SystemExit(1)",
+            ]
+
+            result = self.deploy(payload, env, doctor=doctor)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unrecognized target preserved", result.stderr)
+            self.assertEqual(manifest.read_bytes(), sentinel)
+        finally:
+            temp.cleanup()
+
+    def test_restore_rename_faults_reconcile_before_and_after_move(self):
+        for phase in ("restore_launcher_before_move", "restore_launcher_after_move"):
+            temp, _base, payload, _hermes, bin_dir, _group, env, targets = self.fixture()
+            try:
+                before = [snapshot(path) for path in targets]
+                result = self.deploy(
+                    payload,
+                    env,
+                    fault=phase,
+                    doctor=[sys.executable, "-c", "raise SystemExit(1)"],
+                )
+                self.assertNotEqual(result.returncode, 0, phase)
+                if phase.endswith("after_move"):
+                    self.assertEqual(before, [snapshot(path) for path in targets], phase)
+                    self.assertFalse(list(bin_dir.glob(".harness.backup-*")), phase)
+                else:
+                    self.assertIsNone(snapshot(bin_dir / "harness"), phase)
+                    backups = list(bin_dir.glob(".harness.backup-*"))
+                    self.assertEqual(len(backups), 1, phase)
+                    self.assertEqual(snapshot(backups[0]), before[5], phase)
+            finally:
+                temp.cleanup()
+
     def test_successful_temporary_deployment_excludes_generated_files_and_records_manifest(self):
         temp, _base, payload, hermes, bin_dir, group, env, _targets = self.fixture()
         try:
@@ -91,12 +378,18 @@ class DeploymentTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             installed = hermes / "skills/software-development/project-lifecycle-harness"
             self.assertTrue((installed / "schemas/final-review.schema.json").is_file())
+            self.assertTrue((installed / "scripts/harness").is_file())
+            stage = hermes / "skills/software-development/verified-agent-harness"
+            self.assertTrue((stage / "scripts/harness_core.py").is_file())
+            self.assertTrue((stage / "scripts/harness_commands.py").is_file())
+            self.assertTrue((stage / "scripts/test_harness.py").is_file())
+            self.assertTrue((stage / "references/contracts/verification.schema.json").is_file())
             self.assertFalse(any(path.name == "__pycache__" or path.suffix == ".pyc"
                                  for path in hermes.rglob("*")))
             self.assertEqual((bin_dir / "harness").read_bytes(), (payload / "bin/harness").read_bytes())
             self.assertEqual((group / ".harness/config.toml").read_bytes(),
                              (payload / "projects/Group/config.toml").read_bytes())
-            manifest = hermes / "codex-harness-deployment-manifest.json"
+            manifest = hermes / "verified-agent-harness-deployment-manifest.json"
             self.assertIn("deployment_manifest_sha256=", result.stdout)
             self.assertEqual(json.loads(manifest.read_text())["frozen_commit"], "test-frozen-commit")
             self.assertEqual(len(list((hermes / "deployment-backups").iterdir())), 1)
@@ -107,7 +400,7 @@ class DeploymentTests(unittest.TestCase):
         temp, _base, payload, hermes, _bin_dir, _group, env, targets = self.fixture()
         try:
             before = [snapshot(path) for path in targets]
-            installed_skill = hermes / "skills/software-development/codex-harness"
+            installed_skill = hermes / "skills/software-development/verified-agent-harness"
             doctor = [sys.executable, "-c",
                       f"from pathlib import Path; Path({str(installed_skill / '__pycache__/bad.pyc')!r}).parent.mkdir(); "
                       f"Path({str(installed_skill / '__pycache__/bad.pyc')!r}).write_bytes(b'generated')"]

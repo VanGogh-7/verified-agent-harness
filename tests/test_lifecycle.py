@@ -22,7 +22,8 @@ import yaml
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "skill" / "scripts" / "harness"
+SCRIPT = ROOT / "lifecycle-skill" / "scripts" / "harness"
+STAGE_SCRIPT = ROOT / "skill" / "scripts" / "harness"
 loader = importlib.machinery.SourceFileLoader("lifecycle_harness", str(SCRIPT))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 assert spec is not None
@@ -31,6 +32,21 @@ loader.exec_module(harness)
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_lifecycle_payload_routes_only_lifecycle_commands_and_new_skill_name(self):
+        commands = set(harness.parser()._subparsers._group_actions[0].choices)
+        self.assertEqual(commands, {"detect", "assess", "bootstrap", "adopt", "activate", "rollback-gc"})
+        skill_text = (ROOT / "lifecycle-skill/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("verified-agent-harness", skill_text)
+        self.assertNotIn("codex-harness", skill_text)
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn(' / "codex-harness"', source)
+        self.assertNotIn("Codex ", source)
+        state = harness.initial_state()
+        self.assertEqual(state["required_assessments"], [])
+        self.assertEqual(state["completed_assessments"], [])
+        self.assertEqual(state["verifier_state"], "not_required")
+        self.assertNotIn("review_passed", state)
+
     @contextlib.contextmanager
     def in_dir(self, path: pathlib.Path):
         old = pathlib.Path.cwd()
@@ -124,8 +140,10 @@ class LifecycleTests(unittest.TestCase):
     def test_compatible_damaged_incompatible_and_dirty_detection(self):
         temp, root = self.git_project()
         try:
-            with self.in_dir(root), contextlib.redirect_stdout(io.StringIO()):
-                harness.init_project(argparse.Namespace())
+            subprocess.run(
+                [str(STAGE_SCRIPT), "init"], cwd=root, check=True,
+                stdout=subprocess.DEVNULL,
+            )
             self.assertEqual(harness.lifecycle_detection(root)["classification"], "COMPATIBLE_HARNESS")
             (root / ".harness/state.json").unlink()
             self.assertEqual(harness.lifecycle_detection(root)["classification"], "DAMAGED_HARNESS")
@@ -192,9 +210,18 @@ class LifecycleTests(unittest.TestCase):
             (root / "linked").symlink_to(outside)
             os.mkfifo(root / "fifo")
             sock = socket.socket(socket.AF_UNIX)
-            sock.bind(str(root / "socket"))
-            for value in ("../outside-context", ".git/config", ".harness/state.json",
-                          "linked", "fifo", "socket"):
+            values = ["../outside-context", ".git/config", ".harness/state.json",
+                      "linked", "fifo"]
+            try:
+                sock.bind(str(root / "socket"))
+            except PermissionError:
+                # Some managed sandboxes forbid creating AF_UNIX nodes. The
+                # remaining hostile path classes are still exercised here.
+                sock.close()
+                sock = None
+            else:
+                values.append("socket")
+            for value in values:
                 with self.subTest(value=value), self.assertRaises(harness.HarnessError):
                     harness.safe_project_file(root, value, "context file")
             outside.unlink(missing_ok=True)
@@ -349,14 +376,20 @@ class LifecycleTests(unittest.TestCase):
     def test_mixed_language_stage_plan_is_rejected(self):
         temp, root = self.git_project()
         try:
-            with self.in_dir(root), contextlib.redirect_stdout(io.StringIO()):
-                harness.init_project(argparse.Namespace())
+            subprocess.run(
+                [str(STAGE_SCRIPT), "init"], cwd=root, check=True,
+                stdout=subprocess.DEVNULL,
+            )
             plan = root / "stage-plan.md"
             plan.write_text("# Baseline\n\nValidate the architecture and security boundaries.\n\n## Hidden\n\n不得修改接口。\n",
                             encoding="utf-8")
-            with self.in_dir(root), self.assertRaises(harness.HarnessError):
-                harness.start_stage(argparse.Namespace(stage="stage-1", slice="slice-1",
-                                                       title="Baseline Validation", plan_file="stage-plan.md"))
+            result = subprocess.run(
+                [str(STAGE_SCRIPT), "start-stage", "--workflow", "VERIFIED",
+                 "--stage", "stage-1", "--slice", "slice-1",
+                 "--title", "Baseline Validation", "--plan-file", "stage-plan.md"],
+                cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout)
         finally:
             temp.cleanup()
 
@@ -496,7 +529,7 @@ class LifecycleTests(unittest.TestCase):
         finally:
             temp.cleanup()
 
-    def test_gate_input_change_is_rejected_before_gate_execution(self):
+    def test_adopted_state_is_compatible_with_stage_engine(self):
         temp, root = self.git_project()
         try:
             (root / "Cargo.toml").write_text("[package]\nname='sample'\nversion='0.1.0'\n", encoding="utf-8")
@@ -510,16 +543,20 @@ class LifecycleTests(unittest.TestCase):
             with self.in_dir(root), contextlib.redirect_stdout(io.StringIO()):
                 harness.adopt_project(self.adoption_args(report, analyst, auditor, approved=True,
                                                          approved_plan_hash=plan["plan_sha256"]))
-            p = harness.paths(root)
-            for path in (p["state"], p["trusted_state"]):
-                state = json.loads(path.read_text())
-                state["workflow_state"] = "VALIDATING"
-                path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            (root / "scripts/verify").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-            with self.in_dir(root), mock.patch.object(harness, "run_logged") as runner, \
-                    self.assertRaisesRegex(harness.HarnessError, "changed before gate execution"):
-                harness.run_gates(argparse.Namespace(level="stage"))
-            runner.assert_not_called()
+            stage_plan = root / "baseline-stage.md"
+            stage_plan.write_text(
+                "# Baseline Stage\n\nValidate the adopted provider-neutral Harness configuration and state.\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "Adopt verified agent harness"], cwd=root, check=True)
+            result = subprocess.run(
+                [str(STAGE_SCRIPT), "start-stage", "--workflow", "VERIFIED",
+                 "--stage", "baseline", "--slice", "baseline-1",
+                 "--title", "Baseline Validation", "--plan-file", "baseline-stage.md"],
+                cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
         finally:
             temp.cleanup()
 
@@ -1312,13 +1349,11 @@ class LifecycleTests(unittest.TestCase):
             archive_root.mkdir(mode=0o700)
             (archive_root / "arbitrary-unbound-data").write_text(
                 "operator-owned replacement\n", encoding="utf-8")
-            output = io.StringIO()
-            with self.in_dir(root), contextlib.redirect_stdout(output):
-                harness.status(argparse.Namespace(json=True))
+            with self.in_dir(root):
+                _lifecycle, warnings = harness.rollback_gc_status(root)
                 harness.garbage_collect_rollback_archive(argparse.Namespace())
-            status_value = json.loads(output.getvalue().splitlines()[0])
             repeated = harness.load_json(journal_path)
-            self.assertIn("UNBOUND_ACTIVE_ARCHIVE_PRESENT", status_value["warnings"])
+            self.assertIn("UNBOUND_ACTIVE_ARCHIVE_PRESENT", warnings)
             self.assertEqual(repeated["rollback_archive"]["gc_phase"], "GC_DETACHED")
             self.assertEqual(repeated["rollback_archive"]["gc_retained_identity"],
                              retained_identity)
@@ -1343,12 +1378,10 @@ class LifecycleTests(unittest.TestCase):
             os.rename(retained_root, preserved)
             retained_root.mkdir(mode=0o700)
             (retained_root / "unrelated").write_text("do not adopt or delete\n", encoding="utf-8")
-            output = io.StringIO()
-            with self.in_dir(root), contextlib.redirect_stdout(output):
-                harness.status(argparse.Namespace(json=True))
+            with self.in_dir(root):
+                _lifecycle, warnings = harness.rollback_gc_status(root)
                 harness.garbage_collect_rollback_archive(argparse.Namespace())
-            status_value = json.loads(output.getvalue().splitlines()[0])
-            self.assertIn("RETAINED_ARCHIVE_DRIFT", status_value["warnings"])
+            self.assertIn("RETAINED_ARCHIVE_DRIFT", warnings)
             self.assertTrue(preserved.exists())
             self.assertTrue(retained_root.exists())
             self.assertEqual((retained_root / "unrelated").read_text(),
@@ -1376,12 +1409,10 @@ class LifecycleTests(unittest.TestCase):
             changed.write_bytes(b"accidental retained archive damage\n")
             changed_bytes = changed.read_bytes()
 
-            output = io.StringIO()
-            with self.in_dir(root), contextlib.redirect_stdout(output):
-                harness.status(argparse.Namespace(json=True))
+            with self.in_dir(root):
+                _lifecycle, warnings = harness.rollback_gc_status(root)
                 harness.garbage_collect_rollback_archive(argparse.Namespace())
-            status_value = json.loads(output.getvalue().splitlines()[0])
-            self.assertIn("RETAINED_ARCHIVE_DRIFT", status_value["warnings"])
+            self.assertIn("RETAINED_ARCHIVE_DRIFT", warnings)
             self.assertEqual(changed.read_bytes(), changed_bytes)
             historical = harness.load_json(journal_path)
             self.assertEqual(historical["lifecycle_state"], "ADOPTION_ROLLED_BACK")
@@ -1389,7 +1420,7 @@ class LifecycleTests(unittest.TestCase):
         finally:
             temp.cleanup()
 
-    def test_doctor_reports_later_retained_archive_drift_without_invoking_hermes(self):
+    def test_rollback_gc_status_reports_later_retained_archive_drift_without_mutation(self):
         temp, root = self.git_project()
         try:
             journal_path, _target = self.completed_rollback(root)
@@ -1397,18 +1428,12 @@ class LifecycleTests(unittest.TestCase):
                 harness.garbage_collect_rollback_archive(argparse.Namespace())
             detached = harness.load_json(journal_path)
             _archive_root, retained_root = self.rollback_gc_roots(detached)
-            preserved = retained_root.with_name(retained_root.name + ".doctor-preserved")
+            preserved = retained_root.with_name(retained_root.name + ".status-preserved")
             os.rename(retained_root, preserved)
             retained_root.mkdir(mode=0o700)
 
-            output = io.StringIO()
-            fake_version = (True, "Hermes Agent v0.19.1")
-            with self.in_dir(root), contextlib.redirect_stdout(output), \
-                    mock.patch.object(harness, "executable_version", return_value=fake_version), \
-                    mock.patch.object(harness.shutil, "which", return_value=None), \
-                    self.assertRaises(harness.HarnessError):
-                harness.doctor(argparse.Namespace(capabilities=False))
-            self.assertIn("RETAINED_ARCHIVE_DRIFT", output.getvalue())
+            _lifecycle, warnings = harness.rollback_gc_status(root)
+            self.assertIn("RETAINED_ARCHIVE_DRIFT", warnings)
             historical = harness.load_json(journal_path)
             self.assertEqual(historical["lifecycle_state"], "ADOPTION_ROLLED_BACK")
             self.assertEqual(historical["rollback_archive"]["gc_phase"], "GC_DETACHED")

@@ -7,7 +7,7 @@ if [[ -n "$(git -C "$SOURCE_ROOT" status --porcelain)" ]]; then
     exit 2
 fi
 FROZEN_COMMIT="$(git -C "$SOURCE_ROOT" rev-parse HEAD)"
-STAGING_ROOT="$(mktemp -d -t codex-harness-deploy.XXXXXX)"
+STAGING_ROOT="$(mktemp -d -t verified-agent-harness-deploy.XXXXXX)"
 trap 'rm -r -- "$STAGING_ROOT"' EXIT
 git -C "$SOURCE_ROOT" archive --format=tar "$FROZEN_COMMIT" | tar -xf - -C "$STAGING_ROOT"
 

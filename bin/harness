@@ -1,9 +1,18 @@
 #!/bin/sh
 set -eu
 HERMES_ROOT="${HERMES_HOME:-$HOME/.hermes}"
-SCRIPT="$HERMES_ROOT/skills/software-development/codex-harness/scripts/harness"
+STAGE_SCRIPT="$HERMES_ROOT/skills/software-development/verified-agent-harness/scripts/harness"
+LIFECYCLE_SCRIPT="$HERMES_ROOT/skills/software-development/project-lifecycle-harness/scripts/harness"
+case "${1:-}" in
+  detect|assess|bootstrap|adopt|activate|rollback-gc)
+    SCRIPT="$LIFECYCLE_SCRIPT"
+    ;;
+  *)
+    SCRIPT="$STAGE_SCRIPT"
+    ;;
+esac
 if [ ! -f "$SCRIPT" ]; then
-  printf '%s\n' "harness: global codex-harness Skill is not installed at $SCRIPT" >&2
+  printf '%s\n' "harness: required Harness component is not installed at $SCRIPT" >&2
   exit 127
 fi
 exec python3 "$SCRIPT" "$@"
