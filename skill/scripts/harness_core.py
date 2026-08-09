@@ -1190,6 +1190,40 @@ def candidate_identity(root: pathlib.Path, base_sha: str | None = None) -> tuple
     return base, f"candidate-v1:{digest}"
 
 
+def validate_worker_handoff_or_block(root, p, state, result, role, generation, report, pid):
+    try:
+        require_candidate_binding(root, state, result, role)
+    except HarnessError:
+        persist_blocked_worker(p, state, role, dict(state.get("worker") or {}),
+                               f"{ROLE_LABELS[role]} produced an invalid trusted handoff",
+                               generation, report, pid, root=root)
+        raise
+
+
+def agent_startup_failure_class(log_excerpt: str, report: pathlib.Path) -> str | None:
+    """Classify only pre-handoff schema or exec startup failures as infrastructure."""
+    if report.exists() or report.is_symlink():
+        return None
+    lowered = log_excerpt.lower()
+    if ("invalid schema for response_format" in lowered or
+            "invalid schema for response format" in lowered):
+        return "agent_output_schema_startup_rejection"
+    wrapper_context = "harness _cgroup-exec error" in lowered or "os.execvpe" in lowered
+    exec_error = any(marker in lowered for marker in (
+        "filenotfounderror", "permissionerror", "exec format error",
+    ))
+    if wrapper_context and exec_error:
+        return "spawn_exec_failure"
+    return None
+
+
+def agent_schema_startup_rejection(log_excerpt: str, report: pathlib.Path) -> bool:
+    """Narrow schema-startup predicate used by regression tests."""
+    return agent_startup_failure_class(log_excerpt, report) == (
+        "agent_output_schema_startup_rejection"
+    )
+
+
 def q(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 

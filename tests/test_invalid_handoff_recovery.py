@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import importlib.util
-import os
+import argparse
+import contextlib
 from pathlib import Path
 import unittest
 
@@ -33,9 +34,9 @@ class InvalidHandoffRecoveryTests(unittest.TestCase):
             "base_sha": base,
             "candidate_id": candidate,
             "assessor_findings": {"reviewer": [medium]},
-            "owner": {"pid": os.getpid(), "identity": H["process_identity"](os.getpid()),
+            "owner": {"pid": 999_999_999, "identity": None,
                       "generation": generation},
-            "worker": {"role": "verifier", "pid": os.getpid(), "status": "running",
+            "worker": {"role": "verifier", "pid": 999_999_999, "status": "running",
                        "generation": generation, "stage_id": state["stage_id"],
                        "slice_id": state["slice_id"], "attempt": 1,
                        "base_sha": base, "candidate_id": candidate,
@@ -57,13 +58,21 @@ class InvalidHandoffRecoveryTests(unittest.TestCase):
                 current = H["load_state"](paths)
                 H["validate_worker_handoff_or_block"](
                     root, paths, current, report, "verifier", generation,
-                    report_path, os.getpid(),
+                    report_path, 999_999_999,
                 )
 
         final = H["load_state"](paths)
         self.assertEqual(final["workflow_state"], "BLOCKED")
         self.assertEqual(final["worker"]["status"], "failed")
         self.assertEqual(H["load_json"](paths["trusted_checkpoint"])["worker_status"], "failed")
+        with contextlib.chdir(root):
+            H["recover"](argparse.Namespace(
+                retry=True, ack_human=False, reopen_review=False,
+                reason=None, plan_file=None,
+            ))
+        retried = H["load_state"](paths)
+        self.assertEqual(retried["workflow_state"], "ASSESSING")
+        self.assertIsNone(retried["worker"])
 
 
 if __name__ == "__main__":

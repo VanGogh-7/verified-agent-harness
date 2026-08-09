@@ -852,40 +852,6 @@ def mark_worker_blocked(p: dict[str, pathlib.Path], role: str,
                                failure_class=failure_class)
 
 
-def validate_worker_handoff_or_block(root, p, state, result, role, generation, report, pid):
-    try:
-        require_candidate_binding(root, state, result, role)
-    except HarnessError:
-        persist_blocked_worker(p, state, role, dict(state.get("worker") or {}),
-                               f"{ROLE_LABELS[role]} produced an invalid trusted handoff",
-                               generation, report, pid, root=root)
-        raise
-
-
-def agent_startup_failure_class(log_excerpt: str, report: pathlib.Path) -> str | None:
-    """Classify only pre-handoff schema or exec startup failures as infrastructure."""
-    if report.exists() or report.is_symlink():
-        return None
-    lowered = log_excerpt.lower()
-    if ("invalid schema for response_format" in lowered or
-            "invalid schema for response format" in lowered):
-        return "agent_output_schema_startup_rejection"
-    wrapper_context = "harness _cgroup-exec error" in lowered or "os.execvpe" in lowered
-    exec_error = any(marker in lowered for marker in (
-        "filenotfounderror", "permissionerror", "exec format error",
-    ))
-    if wrapper_context and exec_error:
-        return "spawn_exec_failure"
-    return None
-
-
-def agent_schema_startup_rejection(log_excerpt: str, report: pathlib.Path) -> bool:
-    """Narrow schema-startup predicate used by regression tests."""
-    return agent_startup_failure_class(log_excerpt, report) == (
-        "agent_output_schema_startup_rejection"
-    )
-
-
 def cgroup_exec(args: argparse.Namespace) -> None:
     cgroup = validate_worker_cgroup(pathlib.Path(args.cgroup))
     command = list(args.argv)
@@ -1610,6 +1576,13 @@ def recover(args: argparse.Namespace) -> None:
             emit("recover", "noop", state="STAGE_COMPLETED")
             return
         if args.retry:
+            if (state["workflow_state"] == "CHANGES_REQUIRED"
+                    and state.get("verifier_state") == "pending"
+                    and set(state.get("required_assessments", []))
+                    <= set(state.get("completed_assessments", []))):
+                transition(p, state, "ASSESSING", "retry verifier after invalid handoff")
+                emit("recover", "ok", state="ASSESSING")
+                return
             if state["workflow_state"] != "BLOCKED":
                 raise HarnessError("recover --retry requires BLOCKED")
             if live_owner:
@@ -1622,7 +1595,8 @@ def recover(args: argparse.Namespace) -> None:
             elif process_alive(worker.get("pid"), worker.get("process_identity")):
                 raise HarnessError("cannot retry while the recorded worker process is still alive")
             infrastructure_retry = state.get("tester_outcome") == "flaky_or_infra"
-            target = ("ASSESSING" if infrastructure_retry else
+            verifier_retry = worker.get("role") == "verifier" and worker.get("status") == "failed"
+            target = ("ASSESSING" if infrastructure_retry or verifier_retry else
                       "CHANGES_REQUIRED" if state.get("attempt", 0) else "SLICE_READY")
             state["owner"] = None
             state["worker"] = None
@@ -1636,6 +1610,10 @@ def recover(args: argparse.Namespace) -> None:
                 state.setdefault("evidence_counters", {}).pop("tester_findings", None)
                 runtime_unlink(p["trusted_test"])
                 runtime_unlink(p["runtime"] / REPORT_FILES["tester"])
+                invalidate_checkpoint(p)
+            elif verifier_retry:
+                runtime_unlink(p["trusted_verification"])
+                runtime_unlink(p["runtime"] / REPORT_FILES["verifier"])
                 invalidate_checkpoint(p)
             transition(p, state, target, "human authorized recovery retry")
             emit("recover", "ok", state=target)
