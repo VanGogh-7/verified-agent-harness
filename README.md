@@ -48,7 +48,7 @@ Generic templates remain provider-neutral: `[agent_runtime.models]` and `[agent_
 
 | Role | Model/reasoning |
 |---|---|
-| Implementer | Terra/xhigh |
+| Implementer | Terra/ultra |
 | Correctness Reviewer | Sol/medium |
 | Tester | Terra/xhigh |
 | Security Reviewer | Sol/medium |
@@ -61,7 +61,7 @@ Generic templates remain provider-neutral: `[agent_runtime.models]` and `[agent_
 | Independent Auditor | Sol/medium |
 | Final Lifecycle Reviewer | Sol/medium |
 
-The reference adapter derives `medium` for configured Sol and `xhigh` for configured Terra or Luna when the role effort is omitted; an explicit valid role effort wins. The lifecycle labels are read-only routing labels only: lifecycle state remains outside the Stage engine.
+The bundled Group policy explicitly assigns `ultra` to the Implementer so complex writable work receives the strongest planning, debugging, and correction effort. The reference adapter still derives `medium` for configured Sol and `xhigh` for configured Terra or Luna when a role effort is omitted; an explicit valid role effort wins. The lifecycle labels are read-only routing labels only: lifecycle state remains outside the Stage engine.
 
 ## Workflow classes
 

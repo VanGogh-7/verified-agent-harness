@@ -20,7 +20,7 @@ if it is `Terra` or `Luna`, its omitted effort is `xhigh`.
 
 | Role | Default |
 |---|---|
-| Implementer | Terra/xhigh |
+| Implementer | Terra/ultra |
 | Correctness Reviewer | Sol/medium |
 | Tester | Terra/xhigh |
 | Security Reviewer | Sol/medium |
@@ -32,6 +32,8 @@ if it is `Terra` or `Luna`, its omitted effort is `xhigh`.
 | Architecture Analyst | Terra/xhigh |
 | Independent Auditor | Sol/medium |
 | Final Lifecycle Reviewer | Sol/medium |
+
+The bundled Group configuration explicitly routes the Implementer at `ultra` effort because it is the only writer and must reason through implementation, debugging, and repair paths. Other Terra/Luna roles retain the adapter's `xhigh` policy unless explicitly overridden.
 
 Explorer, Researcher, Test Triage, and Log Triage remain read-only and
 non-authoritative. Their `run-advisory` output is never Stage approval evidence.

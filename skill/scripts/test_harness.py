@@ -197,7 +197,7 @@ class ContractTests(unittest.TestCase):
         if group_config_path.exists():
             group_config = tomllib.loads(group_config_path.read_text(encoding="utf-8"))
             expected = {
-                "implementer": ("gpt-5.6-terra", "xhigh"), "reviewer": ("gpt-5.6-sol", "medium"),
+                "implementer": ("gpt-5.6-terra", "ultra"), "reviewer": ("gpt-5.6-sol", "medium"),
                 "tester": ("gpt-5.6-terra", "xhigh"), "security_reviewer": ("gpt-5.6-sol", "medium"),
                 "verifier": ("gpt-5.6-sol", "medium"), "explorer": ("gpt-5.6-luna", "xhigh"),
                 "researcher": ("gpt-5.6-terra", "xhigh"), "test_triage": ("gpt-5.6-luna", "xhigh"),
@@ -228,7 +228,7 @@ class ContractTests(unittest.TestCase):
         policy_paths = (SKILL_ROOT / "adapters" / "README.md", SKILL_ROOT.parent / "README.md")
         for path in (path for path in policy_paths if path.exists()):
             text = path.read_text(encoding="utf-8")
-            for phrase in ("Implementer", "Terra/xhigh", "Independent Auditor",
+            for phrase in ("Implementer", "Terra/ultra", "Independent Auditor",
                            "Sol/medium", "Final Lifecycle Reviewer"):
                 self.assertIn(phrase, text)
         lifecycle_path = next(path for path in (

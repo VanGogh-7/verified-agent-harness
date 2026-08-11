@@ -48,7 +48,8 @@ preflight_timeout_seconds = 60
 
 [agent_runtime.reasoning_efforts]
 # Optional per-role effort. Omit keys to let the selected adapter apply its policy.
-# implementer = "high"
+# Implementers benefit from the strongest available planning/debugging effort on complex writes.
+# implementer = "ultra"
 # reviewer = "high"
 # tester = "high"
 # security_reviewer = "high"
