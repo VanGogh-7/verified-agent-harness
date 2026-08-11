@@ -60,7 +60,7 @@ Use the configured agent runtime adapter for real workers, bind any external ses
 
 ## Candidate and evidence policy
 
-`harness candidate-id --json` returns the current identity. The identity is derived from `candidate-v1`, the Stage baseline `base_sha`, and exact changed worktree content. Credential-shaped files contribute metadata only; their contents are never read. All role reports repeat attempt, base, and candidate. Mismatch fails closed for assessors, Verifier, and approval.
+`harness candidate-id --json` returns the current identity. The identity is derived from `candidate-v1`, the Stage baseline `base_sha`, exact Git status, and exact changed worktree content. Candidate capture requires two consecutive matching worktree fingerprints and fails closed after bounded retries if the tree is changing. Because index status participates in the identity, finalize staging before gates and assessors; staging or unstaging afterward requires fresh candidate-bound evidence. Credential-shaped files contribute metadata only; their contents are never read. All role reports repeat attempt, base, and candidate. Mismatch fails closed for assessors, Verifier, and approval.
 
 Canonical state and validated evidence live under `.git/harness-control/`. Project-facing `.harness/state.json` and runtime reports are mirrors. The protected baseline binds Git HEAD, stable Git configuration, and configured protected files. State uses atomic replace, fsync, a lock, and revision checks.
 

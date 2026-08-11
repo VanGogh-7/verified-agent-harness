@@ -758,6 +758,7 @@ def load_config(p: dict[str, pathlib.Path]) -> dict[str, Any]:
     if runtime.get("ephemeral") is not True:
         raise HarnessError("[agent_runtime].ephemeral must be true")
     runtime_role_routing(runtime)
+    agent_preflight_config(runtime)
     if cfg.get("harness_version") == HARNESS_VERSION:
         language = cfg.get("language", {})
         required_language = {
@@ -789,6 +790,73 @@ def runtime_role_routing(runtime: dict[str, Any]) -> tuple[dict[str, str], dict[
                for effort in efforts.values()):
         raise HarnessError("[agent_runtime.reasoning_efforts] values are invalid")
     return models, efforts
+
+
+def agent_preflight_config(runtime: dict[str, Any]) -> tuple[list[str], int]:
+    """Validate the optional trusted launch preflight without executing it."""
+    configured = runtime.get("preflight_argv", [])
+    if (not isinstance(configured, list)
+            or not all(isinstance(item, str) and item and "\x00" not in item
+                       for item in configured)):
+        raise HarnessError("[agent_runtime].preflight_argv must be a string array")
+    timeout = runtime.get("preflight_timeout_seconds", 60)
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 300:
+        raise HarnessError("[agent_runtime].preflight_timeout_seconds must be an integer from 1 to 300")
+    expanded = [item.replace("{skill_root}", str(skill_root())) for item in configured]
+    return expanded, timeout
+
+
+def run_agent_preflight(cfg: dict[str, Any], root: pathlib.Path) -> dict[str, Any]:
+    """Run a configured trusted argv hook with no captured output or shell."""
+    runtime = cfg.get("agent_runtime")
+    if not isinstance(runtime, dict):
+        raise HarnessError("[agent_runtime] is required")
+    argv, timeout = agent_preflight_config(runtime)
+    if not argv:
+        return {"configured": False, "status": "not-configured"}
+    try:
+        result = subprocess.run(
+            argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False, timeout=timeout,
+            env=worker_environment(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HarnessError("trusted agent preflight timed out") from exc
+    except OSError as exc:
+        raise HarnessError(f"trusted agent preflight could not start: {type(exc).__name__}") from exc
+    if result.returncode != 0:
+        raise HarnessError(f"trusted agent preflight failed with exit status {result.returncode}")
+    return {"configured": True, "status": "passed", "completed_at": utc_now()}
+
+
+def drain_recorded_worker(worker: dict[str, Any], action: str) -> None:
+    """Drain recorded containment, or refuse to forget a live uncontained worker."""
+    value = worker.get("cgroup")
+    cgroup = pathlib.Path(value) if isinstance(value, str) and value else None
+    if cgroup is not None:
+        destroy_worker_cgroup(cgroup, kill=True)
+    if process_alive(worker.get("pid"), worker.get("process_identity")):
+        raise HarnessError(f"cannot {action} while the recorded worker process is still alive")
+
+
+def clear_assessor_retry_evidence(p: dict[str, pathlib.Path], state: dict[str, Any],
+                                  role: str) -> None:
+    """Clear only one assessor's unaccepted evidence before a same-candidate retry."""
+    if role == "tester":
+        state["tester_outcome"] = None
+    state["completed_assessments"] = [
+        item for item in state.get("completed_assessments", []) if item != role
+    ]
+    state.setdefault("assessor_findings", {}).pop(role, None)
+    state["unresolved_findings"] = [
+        finding for values in state.get("assessor_findings", {}).values() for finding in values
+    ]
+    state.setdefault("evidence_counters", {}).pop(f"{role}_findings", None)
+    trusted = {"reviewer": "trusted_review", "tester": "trusted_test",
+               "security_reviewer": "trusted_security_review"}[role]
+    runtime_unlink(p[trusted])
+    runtime_unlink(p["runtime"] / REPORT_FILES[role])
+    invalidate_checkpoint(p)
 
 
 def adapter_contract_compatible(description: Any) -> bool:
@@ -1186,8 +1254,13 @@ def candidate_identity(root: pathlib.Path, base_sha: str | None = None) -> tuple
     """Return Git base and a content-bound identity for an uncommitted candidate."""
     base = base_sha or git_head(root)
     fingerprint = worktree_fingerprint(root)
-    digest = hashlib.sha256(f"candidate-v1\0{base}\0{fingerprint}".encode()).hexdigest()
-    return base, f"candidate-v1:{digest}"
+    for _attempt in range(3):
+        confirmed = worktree_fingerprint(root)
+        if confirmed == fingerprint:
+            digest = hashlib.sha256(f"candidate-v1\0{base}\0{confirmed}".encode()).hexdigest()
+            return base, f"candidate-v1:{digest}"
+        fingerprint = confirmed
+    raise HarnessError("worktree changing during candidate capture")
 
 
 def validate_worker_handoff_or_block(root, p, state, result, role, generation, report, pid):
@@ -1383,6 +1456,8 @@ stage = {toml_commands(stage_gates)}
 [agent_runtime]
 adapter_argv = ["python3", "{{skill_root}}/adapters/codex_cli.py"]
 ephemeral = true
+preflight_argv = []
+preflight_timeout_seconds = 60
 
 [agent_runtime.models]
 

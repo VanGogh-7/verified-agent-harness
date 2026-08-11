@@ -31,6 +31,8 @@ stage = [["./scripts/verify", "full"]]
 [agent_runtime]
 adapter_argv = ["python3", "{skill_root}/adapters/codex_cli.py"]
 ephemeral = true
+preflight_argv = []
+preflight_timeout_seconds = 60
 
 [agent_runtime.models]
 implementer = "gpt-5.6-terra"

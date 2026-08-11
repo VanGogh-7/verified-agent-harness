@@ -146,6 +146,8 @@ harness approve-slice --complete-stage
 
 For a security-sensitive Stage, select `--workflow SECURITY` at Stage start and run `harness run-security-reviewer` before the Verifier. Workflow policy cannot be toggled during an active Stage.
 
+Deployments that can check provider authentication or other launch prerequisites without exposing secrets may set `[agent_runtime].preflight_argv` and an optional `preflight_timeout_seconds` (1–300). The trusted argv runs with no shell and discarded input/output before a worker generation or business attempt is allocated; any failure leaves workflow state unchanged.
+
 Use optional advice without changing the Stage evidence DAG:
 
 ```bash

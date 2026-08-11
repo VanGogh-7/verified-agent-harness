@@ -5,6 +5,15 @@ argv array. It never uses a shell. The configuration is trusted control-plane
 state, is included in the protected baseline, and must not be editable by worker
 roles.
 
+An installation may also configure `[agent_runtime].preflight_argv` as a trusted
+argv array with `preflight_timeout_seconds` from 1 through 300. Immediately before
+each worker launch, while holding the canonical state lock and before allocating
+an attempt, owner, generation, or worker identity, the Harness runs this command
+with the bounded worker environment. Standard input and both output streams are
+discarded, so checkpoint state records only `not-configured` or a concise passed
+result and never captures credentials. A timeout, spawn error, or nonzero status
+fails closed without consuming a business attempt.
+
 Every adapter invocation appends these arguments in this exact order:
 
 ```text

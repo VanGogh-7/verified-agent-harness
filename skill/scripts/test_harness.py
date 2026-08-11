@@ -807,7 +807,7 @@ class StateAndSnapshotTests(unittest.TestCase):
         self.assertEqual(retried["candidate_id"], candidate_id)
         self.assertIsNone(retried["tester_outcome"])
 
-    def test_non_infrastructure_blocked_tester_keeps_generic_recovery(self) -> None:
+    def test_non_infrastructure_blocked_tester_retries_same_candidate_assessment(self) -> None:
         temp, root, paths = self.make_harness_repo()
         self.addCleanup(temp.cleanup)
         generation = "a" * 32
@@ -832,7 +832,7 @@ class StateAndSnapshotTests(unittest.TestCase):
                 reason=None, plan_file=None,
             ))
         retried = H["load_state"](paths)
-        self.assertEqual(retried["workflow_state"], "CHANGES_REQUIRED")
+        self.assertEqual(retried["workflow_state"], "ASSESSING")
         self.assertEqual(retried["attempt"], 1)
 
     def test_approval_rejects_flaky_tester_evidence_defense_in_depth(self) -> None:

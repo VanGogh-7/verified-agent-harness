@@ -689,6 +689,7 @@ def write_checkpoint(p: dict[str, pathlib.Path], state: dict[str, Any], role: st
              "owner_identity": (state.get("owner") or {}).get("identity"),
              "generation": generation,
              "worker_cgroup": (state.get("worker") or {}).get("cgroup"),
+             "preflight": (state.get("worker") or {}).get("preflight"),
              "attempt": state.get("attempt"),
              "base_sha": state.get("base_sha"), "candidate_id": state.get("candidate_id"),
              "worker_run_seq": state.get("worker_run_seq", 0),
@@ -904,18 +905,20 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
         if role == "implementer":
             allowed = {"SLICE_READY", "CHANGES_REQUIRED"}
         elif role == "reviewer":
-            allowed = {"VALIDATING"}
+            allowed = {"VALIDATING", "ASSESSING"}
         elif role in {"tester", "security_reviewer"}:
             allowed = {"ASSESSING"}
         else:
             allowed = {"ASSESSING"}
         if state["workflow_state"] not in allowed:
             raise HarnessError(f"run-{role} not allowed from {state['workflow_state']}")
+        completed = state.get("completed_assessments", [])
+        if role == "reviewer" and state["workflow_state"] == "ASSESSING" and role in completed:
+            raise HarnessError("reviewer already has accepted evidence for this candidate")
         if role != "implementer" and not state.get("gates_passed"):
             raise HarnessError(f"{role} requires passing deterministic gates")
         if role != "implementer" and state.get("gate_level") not in {"slice", "stage"}:
             raise HarnessError(f"{role} requires a passing slice or stage gate")
-        completed = state.get("completed_assessments", [])
         if role == "tester" and "reviewer" not in completed:
             raise HarnessError("tester requires a completed Correctness Reviewer report")
         if role == "security_reviewer":
@@ -940,11 +943,12 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
         existing_owner = state.get("owner")
         if owner_alive(existing_owner):
             raise HarnessError("another live Harness owner already controls this project")
+        if role == "implementer" and int(state.get("attempt", 0)) >= max_attempts:
+            transition(p, state, "HUMAN_CHECKPOINT", "Slice attempt limit exceeded")
+            raise HarnessError("max_slice_attempts exceeded; HUMAN_CHECKPOINT required")
+        preflight = run_agent_preflight(cfg, root)
         generation = secrets.token_hex(16)
         if role == "implementer":
-            if int(state.get("attempt", 0)) >= max_attempts:
-                transition(p, state, "HUMAN_CHECKPOINT", "Slice attempt limit exceeded")
-                raise HarnessError("max_slice_attempts exceeded; HUMAN_CHECKPOINT required")
             clear_trusted_evidence(p)
             state["worker_run_seq"] = int(state.get("worker_run_seq", 0)) + 1
             state["attempt"] = int(state.get("attempt", 0)) + 1
@@ -963,7 +967,10 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
             transition(p, state, "IMPLEMENTING", "Implementer launch")
         elif role == "reviewer":
             state["worker_run_seq"] = int(state.get("worker_run_seq", 0)) + 1
-            transition(p, state, "ASSESSING", "independent Correctness Reviewer launch")
+            if state["workflow_state"] == "VALIDATING":
+                transition(p, state, "ASSESSING", "independent Correctness Reviewer launch")
+            else:
+                save_state(p, state)
         elif role == "verifier":
             state["worker_run_seq"] = int(state.get("worker_run_seq", 0)) + 1
             transition(p, state, "VERIFYING", "independent Verifier launch")
@@ -986,6 +993,7 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
                            "launch_worktree_fingerprint": (
                                launch_worktree_fingerprint if role == "implementer" else None
                            ),
+                           "preflight": preflight,
                            "business_attempt_committed": role == "implementer",
                            "expected_output": str(report), "started_at": utc_now()}
         save_state(p, state, mirror=False)
@@ -1036,6 +1044,7 @@ def run_worker(args: argparse.Namespace, role: str) -> None:
                                "launch_worktree_fingerprint": state["worker"].get(
                                    "launch_worktree_fingerprint"
                                ),
+                               "preflight": state["worker"].get("preflight"),
                                "business_attempt_committed": role == "implementer",
                                "started_at": utc_now()}
             try:
@@ -1595,22 +1604,16 @@ def recover(args: argparse.Namespace) -> None:
             elif process_alive(worker.get("pid"), worker.get("process_identity")):
                 raise HarnessError("cannot retry while the recorded worker process is still alive")
             infrastructure_retry = state.get("tester_outcome") == "flaky_or_infra"
+            assessor_role = worker.get("role")
+            assessor_retry = assessor_role in {"reviewer", "tester", "security_reviewer"}
             verifier_retry = worker.get("role") == "verifier" and worker.get("status") == "failed"
-            target = ("ASSESSING" if infrastructure_retry or verifier_retry else
+            target = ("ASSESSING" if infrastructure_retry or assessor_retry or verifier_retry else
                       "CHANGES_REQUIRED" if state.get("attempt", 0) else "SLICE_READY")
             state["owner"] = None
             state["worker"] = None
-            if infrastructure_retry:
-                state["tester_outcome"] = None
-                state.setdefault("assessor_findings", {}).pop("tester", None)
-                state["unresolved_findings"] = [
-                    finding for values in state.get("assessor_findings", {}).values()
-                    for finding in values
-                ]
-                state.setdefault("evidence_counters", {}).pop("tester_findings", None)
-                runtime_unlink(p["trusted_test"])
-                runtime_unlink(p["runtime"] / REPORT_FILES["tester"])
-                invalidate_checkpoint(p)
+            if infrastructure_retry or assessor_retry:
+                role_to_retry = "tester" if infrastructure_retry else str(assessor_role)
+                clear_assessor_retry_evidence(p, state, role_to_retry)
             elif verifier_retry:
                 runtime_unlink(p["trusted_verification"])
                 runtime_unlink(p["runtime"] / REPORT_FILES["verifier"])
@@ -1623,6 +1626,7 @@ def recover(args: argparse.Namespace) -> None:
                 raise HarnessError("recover --ack-human requires HUMAN_CHECKPOINT")
             if live_owner:
                 raise HarnessError("cannot acknowledge while the recorded Harness owner is still alive")
+            drain_recorded_worker(worker, "acknowledge")
             state["attempt"] = 0
             state["checkpoint_epoch"] = int(state.get("checkpoint_epoch", 0)) + 1
             state["gates_passed"] = False

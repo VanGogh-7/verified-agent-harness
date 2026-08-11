@@ -38,4 +38,4 @@ The narrow `APPROVED -> CHANGES_REQUIRED` edge is used only by operator-authoriz
 
 The narrow `CHANGES_REQUIRED -> ASSESSING` edge is used only to retry a semantically invalid Verifier handoff before any Verifier decision has been accepted.
 
-A required Tester outcome of `flaky_or_infra` enters `BLOCKED`. An authorized infrastructure retry returns directly to `ASSESSING` with the same candidate attempt; it does not create an Implementer repair attempt.
+A required Tester outcome of `flaky_or_infra` enters `BLOCKED`. An authorized infrastructure retry returns directly to `ASSESSING` with the same candidate attempt; it does not create an Implementer repair attempt. The same rule applies to operational failures or blocked handoffs from any required assessor: recovery retries that assessor, preserves accepted peer evidence, and never infers a product repair from assessor infrastructure failure.
