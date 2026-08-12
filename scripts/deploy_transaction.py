@@ -260,7 +260,8 @@ def main() -> int:
     generation = uuid.uuid4().hex
     targets = [
         ("legacy_skill", hermes / "skills/software-development/codex-harness", None, "remove"),
-        ("agent_skill", hermes / "skills/software-development/verified-agent-harness", payload / "skill", "dir"),
+        ("legacy_verified_skill", hermes / "skills/software-development/verified-agent-harness", None, "remove"),
+        ("agent_skill", hermes / "skills/software-development/agent-harness", payload / "skill", "dir"),
         ("lifecycle_skill", hermes / "skills/software-development/project-lifecycle-harness", payload / "lifecycle-skill", "dir"),
         ("legacy_plugin", hermes / "plugins/codex-harness-context", None, "remove"),
         ("plugin", hermes / "plugins/verified-agent-harness-context", payload / "plugin", "dir"),

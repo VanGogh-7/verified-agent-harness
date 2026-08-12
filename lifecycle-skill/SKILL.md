@@ -8,14 +8,14 @@ platforms: [linux]
 metadata:
   hermes:
     tags: [project-lifecycle, bootstrap, adoption, harness]
-    related_skills: [verified-agent-harness]
+    related_skills: [agent-harness]
 ---
 
 # Project Lifecycle Harness
 
 ## Boundary and language policy
 
-Own project entry and readiness only. Do not absorb or duplicate the `verified-agent-harness` Stage/Slice engine. The installed repository `bin/harness` is the sole command router: it sends `detect`, `assess`, `bootstrap`, `adopt`, `activate`, and `rollback-gc` here, while the Stage Skill parser does not expose those commands. Once the lifecycle state is `HARNESS_READY`, delegate execution to `verified-agent-harness`.
+Own project entry and readiness only. Do not absorb or duplicate the `agent-harness` Stage/Slice engine. The installed repository `bin/harness` is the sole command router: it sends `detect`, `assess`, `bootstrap`, `adopt`, `activate`, and `rollback-gc` here, while the Stage Skill parser does not expose those commands. Once the lifecycle state is `HARNESS_READY`, delegate execution to `agent-harness`.
 
 Detect the current human operator's language from the active conversation. Use it for discussion, progress, approval, checkpoint, and completion messages in that conversation only. Ask architecture questions progressively, usually one focused group at a time. Do not proactively correct the operator's grammar, spelling, or wording. Re-detect language in a new conversation; never bind it to a project or user.
 
@@ -38,7 +38,7 @@ Run `harness detect --json`. Detection is read-only.
 2. Write an English `PROJECT_BRIEF.md` draft from `templates/PROJECT_BRIEF.md` outside the target if the directory must remain pristine.
 3. Obtain one explicit operator approval for the complete brief. Do not reinterpret a non-English approval.
 4. Run `harness bootstrap --brief <path> --dry-run`, review every `CREATE`, `MODIFY`, `PRESERVE`, and `REJECT` entry, obtain approval, then run `harness bootstrap --brief <path> --approved --approved-plan-hash <sha256>`. This creates Git, standard English project docs, and the Harness; it does not mark readiness.
-5. Define an English baseline Stage for the initial scaffold. Use `harness start-stage`, `run-implementer`, baseline gates, all policy-required independent assessors, `run-verifier`, and `approve-slice --complete-stage` exactly as required by `verified-agent-harness`. Implementer is workspace-write; assessors and Verifier are independent and read-only.
+5. Define an English baseline Stage for the initial scaffold. Use `harness start-stage`, `run-implementer`, baseline gates, all policy-required independent assessors, `run-verifier`, and `approve-slice --complete-stage` exactly as required by `agent-harness`. Implementer is workspace-write; assessors and Verifier are independent and read-only.
 6. Run a separate Final Lifecycle Reviewer read-only lifecycle review returning the contract in `schemas/final-review.schema.json`, then `harness activate --final-review <path>`. If activation is interrupted after evidence persistence, use `harness activate --resume`; do not reread or replace the approved final report.
 
 ## BROWNFIELD_ADOPTION
@@ -48,7 +48,7 @@ Run `harness detect --json`. Detection is read-only.
 3. Validate both reports with `harness assess --analyst-report <path> --auditor-report <path> --json`. Missing or malformed reports stop adoption.
 4. Synthesize an English `HARNESS_ADOPTION_REPORT.md` from `templates/HARNESS_ADOPTION_REPORT.md`. Ask the operator to approve detected architecture, protected paths, quality gates, context files, and adoption constraints.
 5. Run `harness adopt --report <path> --analyst-report <path> --auditor-report <path> --dry-run`. Review the canonical mutation manifest and copy the exact generated approval block, including derived argv arrays, into the report. Only after approval run the same command with `--approved --approved-plan-hash <sha256>`. If interrupted, run `harness adopt --resume`; use `harness adopt --rollback` for CAS-protected restoration; never inject lifecycle state manually.
-6. Use a narrowly scoped baseline Stage through `verified-agent-harness` for configuration/state validation only. Run baseline gates, every policy-required independent assessor, and the independent Verifier; complete the Stage, then run the final lifecycle review and `harness activate`.
+6. Use a narrowly scoped baseline Stage through `agent-harness` for configuration/state validation only. Run baseline gates, every policy-required independent assessor, and the independent Verifier; complete the Stage, then run the final lifecycle review and `harness activate`.
 
 During adoption never refactor business code, fix unrelated defects, upgrade dependencies, change public APIs, format the repository, or add product features. `harness assess` and `harness adopt --dry-run` are read-only with respect to business code.
 
@@ -57,7 +57,7 @@ During adoption never refactor business code, fix unrelated defects, upgrade dep
 Run read-only `harness detect --json`, `harness doctor`, `harness status --json`, concise Git checks, and Worker/checkpoint checks. Then:
 
 - `STAGE_DISCUSSION`: discuss and obtain approval for the next Stage.
-- Active or interrupted work: follow `verified-agent-harness` recovery; never launch duplicates.
+- Active or interrupted work: follow `agent-harness` recovery; never launch duplicates.
 - `BLOCKED` or `HUMAN_CHECKPOINT`: request the exact operator decision.
 - Incompatible version: use an explicit migration plan and approval.
 

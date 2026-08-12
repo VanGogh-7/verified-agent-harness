@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 HERMES_ROOT="${HERMES_HOME:-$HOME/.hermes}"
-STAGE_SCRIPT="$HERMES_ROOT/skills/software-development/verified-agent-harness/scripts/harness"
+STAGE_SCRIPT="$HERMES_ROOT/skills/software-development/agent-harness/scripts/harness"
 LIFECYCLE_SCRIPT="$HERMES_ROOT/skills/software-development/project-lifecycle-harness/scripts/harness"
 case "${1:-}" in
   detect|assess|bootstrap|adopt|activate|rollback-gc)

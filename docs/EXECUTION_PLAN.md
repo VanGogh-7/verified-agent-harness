@@ -1,4 +1,4 @@
-# verified-agent-harness 1.0 execution plan
+# agent-harness 1.0 execution plan
 
 Status: Complete; approved for local commit, transactional installation, and publication.
 
@@ -37,7 +37,7 @@ The source repository is authoritative. Installed Skills, plugins, launchers, pr
 
 ## Key decisions
 
-- The distribution, source repository, and Stage/Slice Skill use the `verified-agent-harness` identity. The bundled upper-level `project-lifecycle-harness` Skill remains separately named because it classifies, bootstraps, adopts, and activates repositories before routing compatible projects into the Stage/Slice engine.
+- The source repository retains the historical `verified-agent-harness` repository name, while the distributed Stage/Slice Skill uses the shorter `agent-harness` identity. The bundled upper-level `project-lifecycle-harness` Skill remains separately named because it classifies, bootstraps, adopts, and activates repositories before routing compatible projects into the Stage/Slice engine.
 - Agent adapters are trusted computing-base components responsible for provider sandbox enforcement. The core detects candidate mutation and rejects evidence but does not claim kernel-level containment.
 - Deployment requires exclusive writers for target paths. Rollback retains and reports hidden quarantines rather than risking deletion of an unrelated replacement.
 - The Deep Research report is design input, not runtime authority. Report recommendations were adapted selectively and are distinguished from implemented architecture and rejected scope in the README.

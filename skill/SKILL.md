@@ -1,13 +1,13 @@
 ---
-name: verified-agent-harness
+name: agent-harness
 description: Classify and execute trusted-local, evidence-bound engineering workflows through a provider-neutral agent adapter.
 version: 1.0.0
-author: verified-agent-harness contributors
+author: agent-harness contributors
 license: MIT
 platforms: [linux]
 ---
 
-# verified-agent-harness 1.0
+# agent-harness 1.0
 
 ## Purpose
 

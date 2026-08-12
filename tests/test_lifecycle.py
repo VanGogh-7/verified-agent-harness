@@ -36,7 +36,7 @@ class LifecycleTests(unittest.TestCase):
         commands = set(harness.parser()._subparsers._group_actions[0].choices)
         self.assertEqual(commands, {"detect", "assess", "bootstrap", "adopt", "activate", "rollback-gc"})
         skill_text = (ROOT / "lifecycle-skill/SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("verified-agent-harness", skill_text)
+        self.assertIn("agent-harness", skill_text)
         self.assertNotIn("codex-harness", skill_text)
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn(' / "codex-harness"', source)
@@ -1896,7 +1896,12 @@ class LifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
             config = root / "config.yaml"
-            config.write_text("model: test\nmemory:\n  memory_enabled: true\ncurator:\n  enabled: true\n", encoding="utf-8")
+            config.write_text(
+                "model: test\n"
+                "memory:\n  memory_enabled: true\n"
+                "skills:\n  write_approval: false\n"
+                "curator:\n  enabled: true\n",
+                encoding="utf-8")
             subprocess.run([str(ROOT / "scripts/configure-hermes")], check=True,
                            env={**os.environ, "HERMES_DEPLOY_HOME": str(root)},
                            stdout=subprocess.DEVNULL)
@@ -1905,8 +1910,8 @@ class LifecycleTests(unittest.TestCase):
             self.assertFalse(value["memory"]["user_profile_enabled"])
             self.assertEqual(value["memory"]["nudge_interval"], 0)
             self.assertEqual(value["skills"]["creation_nudge_interval"], 0)
-            self.assertTrue(value["skills"]["write_approval"])
-            self.assertFalse(value["curator"]["enabled"])
+            self.assertFalse(value["skills"]["write_approval"])
+            self.assertTrue(value["curator"]["enabled"])
             self.assertEqual(len(list(root.glob("config.yaml.bak.lifecycle-*"))), 1)
 
 

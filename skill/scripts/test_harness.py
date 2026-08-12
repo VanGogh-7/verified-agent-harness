@@ -240,7 +240,7 @@ class ContractTests(unittest.TestCase):
             self.assertIn(role, lifecycle)
 
     def test_core_branding_and_role_vocabulary_are_provider_neutral(self) -> None:
-        self.assertIn("name: verified-agent-harness", (SKILL_ROOT / "SKILL.md").read_text())
+        self.assertIn("name: agent-harness", (SKILL_ROOT / "SKILL.md").read_text())
         for relative in (
             "scripts/harness", "scripts/harness_core.py", "scripts/harness_commands.py",
             "templates/implementation-prompt.md", "templates/review-prompt.md",

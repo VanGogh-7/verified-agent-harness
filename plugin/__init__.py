@@ -1,4 +1,4 @@
-"""verified-agent-harness context-maintenance tools for Hermes Agent 0.19.1.
+"""agent-harness context-maintenance tools for Hermes Agent 0.19.1.
 
 This plugin deliberately does not mutate the active transcript from inside a
 tool call. The current public PluginContext has no safe post-tool compaction API;

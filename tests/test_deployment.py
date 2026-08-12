@@ -88,6 +88,7 @@ class DeploymentTests(unittest.TestCase):
         bin_dir = base / "bin"
         group = base / "Group"
         for path in (hermes / "skills/software-development/codex-harness",
+                     hermes / "skills/software-development/verified-agent-harness",
                      hermes / "skills/software-development/project-lifecycle-harness",
                      hermes / "plugins/codex-harness-context", bin_dir, group / ".harness"):
             path.mkdir(parents=True)
@@ -98,6 +99,8 @@ class DeploymentTests(unittest.TestCase):
             "model: test\n"
             "memory:\n  memory_enabled: true\n"
             "skills:\n  creation_nudge_interval: 10\n"
+            "  write_approval: false\n"
+            "curator:\n  enabled: true\n"
             "plugins:\n"
             "  enabled: [codex-harness-context, observability/langfuse]\n"
             "  disabled: []\n"
@@ -111,6 +114,7 @@ class DeploymentTests(unittest.TestCase):
         targets = (
             hermes / "skills/software-development/codex-harness",
             hermes / "skills/software-development/verified-agent-harness",
+            hermes / "skills/software-development/agent-harness",
             hermes / "skills/software-development/project-lifecycle-harness",
             hermes / "plugins/codex-harness-context",
             hermes / "plugins/verified-agent-harness-context", bin_dir / "harness",
@@ -412,7 +416,8 @@ class DeploymentTests(unittest.TestCase):
                     self.assertIsNone(snapshot(bin_dir / "harness"), phase)
                     backups = list(bin_dir.glob(".harness.backup-*"))
                     self.assertEqual(len(backups), 1, phase)
-                    self.assertEqual(snapshot(backups[0]), before[5], phase)
+                    launcher_index = targets.index(bin_dir / "harness")
+                    self.assertEqual(snapshot(backups[0]), before[launcher_index], phase)
             finally:
                 temp.cleanup()
 
@@ -424,7 +429,8 @@ class DeploymentTests(unittest.TestCase):
             installed = hermes / "skills/software-development/project-lifecycle-harness"
             self.assertTrue((installed / "schemas/final-review.schema.json").is_file())
             self.assertTrue((installed / "scripts/harness").is_file())
-            stage = hermes / "skills/software-development/verified-agent-harness"
+            stage = hermes / "skills/software-development/agent-harness"
+            self.assertFalse((hermes / "skills/software-development/verified-agent-harness").exists())
             self.assertTrue((stage / "scripts/harness_core.py").is_file())
             self.assertTrue((stage / "scripts/harness_parallel.py").is_file())
             self.assertTrue((stage / "scripts/harness_commands.py").is_file())
@@ -436,6 +442,8 @@ class DeploymentTests(unittest.TestCase):
             self.assertEqual((group / ".harness/config.toml").read_bytes(),
                              (payload / "projects/Group/config.toml").read_bytes())
             configured = yaml.safe_load((hermes / "config.yaml").read_text(encoding="utf-8"))
+            self.assertFalse(configured["skills"]["write_approval"])
+            self.assertTrue(configured["curator"]["enabled"])
             self.assertIn("verified-agent-harness-context", configured["plugins"]["enabled"])
             self.assertNotIn("codex-harness-context", configured["plugins"]["enabled"])
             self.assertEqual(configured["plugins"]["entries"]["verified-agent-harness-context"],
@@ -469,7 +477,7 @@ class DeploymentTests(unittest.TestCase):
 
             result = self.deploy(payload, env)
             self.assertEqual(result.returncode, 0, result.stderr)
-            installed = hermes / "skills/software-development/verified-agent-harness"
+            installed = hermes / "skills/software-development/agent-harness"
             self.assertTrue((installed / "references/contracts/advisory.schema.json").is_file())
             installed_config = tomllib.loads(
                 (payload / "projects/Group/config.toml").read_text(encoding="utf-8")
@@ -528,7 +536,7 @@ class DeploymentTests(unittest.TestCase):
         temp, _base, payload, hermes, _bin_dir, _group, env, targets = self.fixture()
         try:
             before = [snapshot(path) for path in targets]
-            installed_skill = hermes / "skills/software-development/verified-agent-harness"
+            installed_skill = hermes / "skills/software-development/agent-harness"
             doctor = [sys.executable, "-c",
                       f"from pathlib import Path; Path({str(installed_skill / '__pycache__/bad.pyc')!r}).parent.mkdir(); "
                       f"Path({str(installed_skill / '__pycache__/bad.pyc')!r}).write_bytes(b'generated')"]

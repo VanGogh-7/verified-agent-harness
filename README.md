@@ -1,6 +1,6 @@
-# verified-agent-harness 1.0.0
+# agent-harness 1.0.0
 
-`verified-agent-harness` is a provider-neutral, trusted-local engineering workflow. It turns a code change into revision-bound evidence through one writer, deterministic gates, independent read-only assessment, independent verification, and explicit approval. Agent products and orchestration platforms are supplied through adapters rather than encoded as role identities. The project is deliberately a workflow and evidence system, not a general autonomous swarm or a hostile-repository sandbox.
+`agent-harness` is a provider-neutral, trusted-local engineering workflow. It turns a code change into revision-bound evidence through one writer, deterministic gates, independent read-only assessment, independent verification, and explicit approval. Agent products and orchestration platforms are supplied through adapters rather than encoded as role identities. The project is deliberately a workflow and evidence system, not a general autonomous swarm or a hostile-repository sandbox.
 
 The 1.0 redesign was bootstrapped in an isolated staging repository from base `9af9a02dd29c91f32ab5133fb18f92c5fe906ec2`. Its initial candidate (`candidate-v1:15ee0447d998e47e0005d633bcd0efbff39808eb9e852540244c126711bc64d9`) passed 61 deterministic tests and an independent review. Source-repository integration then received a separate security review and additional fixes for attempt accounting, lifecycle command separation, and deployment commit-point recovery. Treat the current Git commit—not the historical staging candidate—as the release identity.
 
@@ -25,7 +25,7 @@ flowchart LR
     CP[(.git/harness-control<br/>trusted canonical evidence)] --- A
 ```
 
-The repository distributes two cooperating Skills as one verified system. `project-lifecycle-harness` is the upper-level entry point that classifies and harnesses a repository; once a project is compatible and activated, the top-level router delegates Stage/Slice execution to `verified-agent-harness`. They are installed and regression-tested together rather than versioned as unrelated components.
+The repository distributes two cooperating Skills as one verified system. `project-lifecycle-harness` is the upper-level entry point that classifies and harnesses a repository; once a project is compatible and activated, the top-level router delegates Stage/Slice execution to `agent-harness`. They are installed and regression-tested together rather than versioned as unrelated components.
 
 The repository has four cooperating layers:
 
@@ -221,7 +221,7 @@ projects/Group/config.toml      deployment-specific project configuration payloa
 scripts/configure-hermes        conservative Hermes configuration transformation
 scripts/deploy                  clean-commit frozen exporter
 scripts/deploy_transaction.py   exact-target transactional installer and rollback
-skill/                          exact verified-agent-harness 1.0.0 candidate payload
+skill/                          exact agent-harness 1.0.0 candidate payload
 tests/                          root integration, lifecycle, and deployment tests
 docs/research/                  unmodified research input and provenance
 ```

@@ -44,9 +44,8 @@ def updated_config(config):
         del entries[legacy_plugin]
     plugins["entries"] = entries
     memory.update({"memory_enabled": False, "user_profile_enabled": False,
-                   "nudge_interval": 0, "write_approval": True})
-    skills.update({"creation_nudge_interval": 0, "write_approval": True})
-    curator["enabled"] = False
+                   "nudge_interval": 0})
+    skills.update({"creation_nudge_interval": 0})
     result.update({"memory": memory, "skills": skills, "curator": curator,
                    "plugins": plugins})
     return result
