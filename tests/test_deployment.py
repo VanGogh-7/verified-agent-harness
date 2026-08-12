@@ -426,6 +426,7 @@ class DeploymentTests(unittest.TestCase):
             self.assertTrue((installed / "scripts/harness").is_file())
             stage = hermes / "skills/software-development/verified-agent-harness"
             self.assertTrue((stage / "scripts/harness_core.py").is_file())
+            self.assertTrue((stage / "scripts/harness_parallel.py").is_file())
             self.assertTrue((stage / "scripts/harness_commands.py").is_file())
             self.assertTrue((stage / "scripts/test_harness.py").is_file())
             self.assertTrue((stage / "references/contracts/verification.schema.json").is_file())

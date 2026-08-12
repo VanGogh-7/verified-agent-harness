@@ -3,7 +3,7 @@
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-for _part_name in ("harness_core.py", "harness_commands.py"):
+for _part_name in ("harness_core.py", "harness_parallel.py", "harness_commands.py"):
     _part_path = _SCRIPT_DIR / _part_name
     _source = _part_path.read_text(encoding="utf-8")
     exec(compile(_source, str(_part_path), "exec"), globals(), globals())

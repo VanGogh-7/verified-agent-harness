@@ -26,7 +26,7 @@ Git HEAD plus a credential-safe worktree fingerprint forms `candidate_id`. A new
 - `FAST`: trivial, localized, low-risk work. Use one writer and direct deterministic checks; do not initialize the Stage engine solely for FAST work.
 - `VERIFIED`: default for nontrivial work. Use Implementer, gates, Correctness Reviewer, Tester, Verifier.
 - `SECURITY`: VERIFIED plus Security Reviewer. Select it with `start-stage --workflow SECURITY`; it cannot be toggled during an active Stage.
-- `DAG`: genuinely independent writers use isolated worktrees and optional outer coordination. Each candidate still passes this inner verified gate before integration.
+- `DAG`: Hermes first validates a decomposition plan, freezes shared contracts, then directs genuinely independent writers in isolated worktrees. The complete integration candidate passes the inner verified gate once after integration.
 - `LONG_RUNNING`: use durable Kanban tasks, event-driven waiting, and explicit completion contracts around the same inner gate.
 
 Kanban is an optional outer durable DAG. Its flexible metadata is never a trusted approval boundary and does not replace `.git/harness-control/`.
@@ -74,6 +74,10 @@ The default budget is the initial candidate plus two repair rounds (`max_slice_a
 
 Never overlap a live Worker or Reviewer with another heavy process; the same rule covers Tester, Security Reviewer, Verifier, advisory execution, builds, tests, benchmarks, and packaging. Check RAM, swap trend, GPU headroom when relevant, and live agent descendants before launch. `CARGO_BUILD_JOBS=4` is the default cap. Logical assessor fan-out may be serial.
 
+For DAG execution, keep a continuous memory guard active for the entire parallel wave. Sample `MemAvailable`, swap headroom, and Linux PSI; selectively pause heavy workers first and resume one only after three recovered samples. Bind every worker to canonical run/task/generation state and complete verified cgroup containment—never trust an arbitrary workers file or signal only a launcher PID. With no active worker, close admission and fall back to serial. An active uncontained worker fails closed to `BLOCKED_UNCONTAINED` until drained.
+
+The Skill provides validation and policy primitives, not an in-process distributed scheduler. Hermes owns outer fan-out and may use writable parallel lanes only when their execution facility exposes complete containment, committed-base identity, and verifiable freeze/thaw. Unpausable delegated children are restricted to bounded read-only analysis; memory pressure causes admission to close and writable work to remain or become serial.
+
 Worker generation, Stage, Slice, attempt, candidate, owner/worker identities, session, and checkpoint epoch are recovery bindings. Stale evidence is rejected for every role. See `references/recovery.md`.
 
 ## Compatibility and migration
@@ -85,6 +89,7 @@ Mandatory model names from the research report are not adopted because product l
 ## Read on demand
 
 - Command order and Kanban boundary: `references/workflow.md`
+- Hermes-led decomposition, shared contracts, memory guard, and integration: `references/parallel-workflow.md`
 - Executable states and transitions: `references/state-machine.md`
 - Recovery and invalidation: `references/recovery.md`
 - Control/source/evidence/reasoning layers: `references/architecture.md`

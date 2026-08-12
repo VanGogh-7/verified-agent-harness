@@ -29,7 +29,7 @@ The repository distributes two cooperating Skills as one verified system. `proje
 
 The repository has four cooperating layers:
 
-- `skill/` is the exact split 1.0.0 Stage/Slice Skill: a small launcher, `harness_core.py`, `harness_commands.py`, strict contracts, templates, references, and its local test suite.
+- `skill/` is the exact split 1.0.0 Stage/Slice Skill: a small launcher, `harness_core.py`, `harness_parallel.py`, `harness_commands.py`, strict contracts, templates, references, and its local test suite.
 - `lifecycle-skill/` routes greenfield bootstrap, brownfield adoption, compatible operation, and explicit migration. Its transactional adoption and rollback engine remains separate from the 1.0 Stage engine.
 - `plugin/` provides optional read-only context occupancy and compaction fallback tools.
 - `bin/harness` routes lifecycle-only commands to the lifecycle component and Stage commands to the 1.0 Skill.
@@ -70,7 +70,7 @@ The bundled Group policy explicitly assigns `ultra` to the Implementer so comple
 | `FAST` | Trivial, localized, low-risk change | One writer plus direct deterministic checks; no Stage engine solely for FAST work |
 | `VERIFIED` | Default nontrivial change | Implementer → gates → Reviewer + Tester → Verifier → approval |
 | `SECURITY` | Security-sensitive scope | VERIFIED plus a required Security Reviewer |
-| `DAG` | Genuinely independent writable tasks | Isolated worktrees and optional Kanban outside the Harness; every integrated candidate still passes the inner verified flow |
+| `DAG` | Genuinely independent writable tasks | Hermes freezes a machine-readable contract, validates isolated Git lanes, applies memory admission/backpressure, and verifies the integrated candidate through the inner flow |
 | `LONG_RUNNING` | Durable asynchronous work | Kanban tasks, event-driven waiting, explicit completion contracts, and the same inner evidence gate |
 
 ## Authority and evidence DAG
@@ -89,6 +89,20 @@ Canonical control state and accepted evidence live under `.git/harness-control/`
 ## Outer orchestration boundary
 
 Kanban or another durable task system is an optional outer coordination plane for DAG and long-running work. It can track dependencies, events, worktrees, retries, and handoffs, but its flexible metadata cannot approve a candidate and never replaces `.git/harness-control/`.
+
+For a Hermes-led DAG, validate and freeze the committed plan before launching writable lanes, validate every lane from Git rather than worker prose, and keep the memory guard active throughout each wave:
+
+```bash
+harness validate-parallel-plan --plan-file parallel-plan.json
+harness freeze-parallel-plan --run-id feature-x --plan-file parallel-plan.json
+harness validate-parallel-lane --base-sha "$BASE" --head-sha "$LANE" --write-path src/component
+harness register-parallel-worker --run-id feature-x --task-id component
+# Move the worker into the returned Harness-owned cgroup, then prove it is populated.
+harness activate-parallel-worker --run-id feature-x --task-id component
+harness memory-guard --run-id feature-x --interval 2
+```
+
+Contract-owner tasks are dependency-free, own only frozen contract paths, and are already complete in the clean committed base. The atomic `.git/harness-parallel/<run_id>/run.json` bundle binds only revalidatable facts: plan, base, contract blobs, lanes, generation, and workers. Each command retains one safely opened directory FD through locking and canonical I/O; canonical files must be owner-controlled, single-link regular files. A worker is admitted only after every dependency is frozen or validated and is then bound to the exact run, task, generation, and complete cgroup v2 containment. Recovery streak and admission decisions remain process-local derived state; three recovered samples are required before one worker resumes. With no active workers Hermes switches to serial; an active uncontained worker enters `BLOCKED_UNCONTAINED` until drained. `memory-guard-step` is read-only and rejects `--apply`.
 
 The Skill does not implement or claim a hosted CI service, distributed scheduler, A2A or MCP transport, or any provider app-server integration. A deployment may use such systems as execution boundaries, but they must preserve the same role permissions, isolated worktrees, candidate binding, and canonical evidence checks. Notifications are wakeups only; the Orchestrator must reread canonical state after each wakeup.
 

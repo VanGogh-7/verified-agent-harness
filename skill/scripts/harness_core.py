@@ -252,6 +252,186 @@ def concise(text: str, limit: int) -> str:
     return clean[-limit:] if len(clean) > limit else clean
 
 
+def parallel_memory_action(*, total_bytes: int, available_bytes: int,
+                           swap_free_bytes: int, psi_some_avg10: float,
+                           psi_full_avg10: float, paused_count: int) -> str:
+    """Return a hysteretic backpressure decision for an outer parallel coordinator."""
+    if min(total_bytes, available_bytes, swap_free_bytes, paused_count) < 0:
+        raise HarnessError("parallel memory metrics must be non-negative")
+    if total_bytes == 0:
+        raise HarnessError("total memory must be positive")
+    gib = 1024 ** 3
+    critical_available = max(gib, int(total_bytes * 0.08))
+    pressured_available = max(2 * gib, int(total_bytes * 0.15))
+    resume_available = max(4 * gib, int(total_bytes * 0.30))
+    critical = (
+        available_bytes <= critical_available
+        or (swap_free_bytes != 0 and swap_free_bytes <= 512 * 1024 ** 2)
+        or psi_full_avg10 >= 1.0
+        or psi_some_avg10 >= 10.0
+    )
+    if critical:
+        return "pause_heavy_first"
+    pressured = (
+        available_bytes <= pressured_available
+        or psi_full_avg10 >= 0.5
+        or psi_some_avg10 >= 5.0
+    )
+    if pressured:
+        return "pause_one"
+    recovered = (
+        available_bytes >= resume_available
+        and (swap_free_bytes == 0 or swap_free_bytes > gib)
+        and psi_full_avg10 < 0.1
+        and psi_some_avg10 < 1.0
+    )
+    if paused_count and recovered:
+        return "resume_one"
+    if paused_count:
+        return "hold"
+    return "continue"
+
+
+def parse_linux_memory_metrics(meminfo: str, pressure: str) -> dict[str, int | float]:
+    values: dict[str, int] = {}
+    for line in meminfo.splitlines():
+        match = re.fullmatch(r"(MemTotal|MemAvailable|SwapFree):\s+(\d+)\s+kB", line.strip())
+        if match:
+            values[match.group(1)] = int(match.group(2)) * 1024
+    if set(values) != {"MemTotal", "MemAvailable", "SwapFree"}:
+        raise HarnessError("Linux memory metrics are incomplete")
+    psi: dict[str, float] = {}
+    for line in pressure.splitlines():
+        match = re.match(r"(some|full)\s+avg10=([0-9]+(?:\.[0-9]+)?)\b", line.strip())
+        if match:
+            psi[match.group(1)] = float(match.group(2))
+    if set(psi) != {"some", "full"}:
+        raise HarnessError("Linux memory pressure metrics are incomplete")
+    return {
+        "total_bytes": values["MemTotal"],
+        "available_bytes": values["MemAvailable"],
+        "swap_free_bytes": values["SwapFree"],
+        "psi_some_avg10": psi["some"],
+        "psi_full_avg10": psi["full"],
+    }
+
+
+def _normalized_parallel_path(raw: str, label: str) -> str:
+    if not raw or "\\" in raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        raise HarnessError(f"{label} must be a normalized project-relative path")
+    path = pathlib.PurePosixPath(raw)
+    if (path.is_absolute() or not path.parts or str(path) != raw
+            or any(part in {"", ".", ".."} for part in path.parts)):
+        raise HarnessError(f"{label} must be a normalized project-relative path")
+    if path.parts[0] in {".git", ".harness"}:
+        raise HarnessError(f"{label} must not target Harness control paths")
+    return str(path)
+
+
+def _parallel_paths_overlap(left: str, right: str) -> bool:
+    a = pathlib.PurePosixPath(left).parts
+    b = pathlib.PurePosixPath(right).parts
+    shared = min(len(a), len(b))
+    return a[:shared] == b[:shared]
+
+
+def parallel_waves(plan: dict[str, Any]) -> list[list[str]]:
+    tasks = {task["id"]: set(task["depends_on"]) for task in plan["tasks"]}
+    completed: set[str] = set()
+    waves: list[list[str]] = []
+    while len(completed) < len(tasks):
+        ready = sorted(task_id for task_id, dependencies in tasks.items()
+                       if task_id not in completed and dependencies <= completed)
+        if not ready:
+            raise HarnessError("parallel task dependency graph contains a cycle")
+        waves.append(ready)
+        completed.update(ready)
+    return waves
+
+
+def validate_parallel_plan(plan: dict[str, Any], schema_file: pathlib.Path) -> dict[str, Any]:
+    validate_schema_value(plan, load_json(schema_file))
+    task_ids = [task["id"] for task in plan["tasks"]]
+    if len(task_ids) != len(set(task_ids)):
+        raise HarnessError("parallel task IDs must be unique")
+    known_tasks = set(task_ids)
+    contract_ids = [contract["id"] for contract in plan["shared_contracts"]]
+    if len(contract_ids) != len(set(contract_ids)):
+        raise HarnessError("shared contract IDs must be unique")
+    known_contracts = set(contract_ids)
+    write_owners: list[tuple[str, str]] = []
+    for task in plan["tasks"]:
+        dependencies = task["depends_on"]
+        if task["id"] in dependencies or not set(dependencies) <= known_tasks:
+            raise HarnessError("parallel task has an invalid dependency")
+        if len(dependencies) != len(set(dependencies)):
+            raise HarnessError("parallel task dependencies must be unique")
+        if not set(task["contract_ids"]) <= known_contracts:
+            raise HarnessError("parallel task references an unknown shared contract")
+        for raw in task["write_paths"]:
+            normalized = _normalized_parallel_path(raw, "parallel write path")
+            for owner, existing in write_owners:
+                if owner != task["id"] and _parallel_paths_overlap(normalized, existing):
+                    raise HarnessError("parallel tasks have an overlapping write path")
+            write_owners.append((task["id"], normalized))
+    task_by_id = {task["id"]: task for task in plan["tasks"]}
+    owner_contract_paths: dict[str, set[str]] = {}
+    for contract in plan["shared_contracts"]:
+        owner = contract["owner"]
+        if owner not in task_by_id:
+            raise HarnessError("shared contract owner must name a parallel task")
+        owner_contract_paths.setdefault(owner, set())
+        owner_paths = [_normalized_parallel_path(path, "contract owner write path")
+                       for path in task_by_id[owner]["write_paths"]]
+        for raw in contract["paths"]:
+            path = _normalized_parallel_path(raw, "shared contract path")
+            owner_contract_paths[owner].add(path)
+            if not any(_parallel_paths_overlap(path, owned) for owned in owner_paths):
+                raise HarnessError("contract owner does not own every shared contract path")
+    for owner, contract_paths in owner_contract_paths.items():
+        owner_task = task_by_id[owner]
+        owner_paths = {_normalized_parallel_path(path, "contract owner write path")
+                       for path in owner_task["write_paths"]}
+        if owner_task["depends_on"] or owner_paths != contract_paths:
+            raise HarnessError("frozen contract owner must be dependency-free and contract-only")
+    waves = parallel_waves(plan)
+    order = plan["integration"]["order"]
+    if set(order) != known_tasks or len(order) != len(task_ids):
+        raise HarnessError("integration order must contain every parallel task exactly once")
+    position = {task_id: index for index, task_id in enumerate(order)}
+    for task in plan["tasks"]:
+        if any(position[dependency] >= position[task["id"]] for dependency in task["depends_on"]):
+            raise HarnessError("integration order violates a task dependency")
+    return plan
+
+
+def validate_parallel_plan_command(args: argparse.Namespace) -> None:
+    root = git_root(True)
+    plan_path = pathlib.Path(args.plan_file)
+    if not plan_path.is_absolute():
+        plan_path = root / plan_path
+    plan = load_json(plan_path)
+    validate_parallel_plan(plan, skill_root() / "references/contracts/parallel-plan.schema.json")
+    current_base = git_head(root)
+    if plan["base_sha"] != current_base:
+        raise HarnessError("parallel plan base_sha does not match current Git HEAD")
+    emit("validate-parallel-plan", "ok", decision=plan["decision"],
+         waves=parallel_waves(plan), tasks=len(plan["tasks"]), base_sha=current_base)
+
+
+def memory_action_command(args: argparse.Namespace) -> None:
+    metrics = parse_linux_memory_metrics(
+        pathlib.Path("/proc/meminfo").read_text(encoding="ascii"),
+        pathlib.Path("/proc/pressure/memory").read_text(encoding="ascii"),
+    )
+    action = parallel_memory_action(**metrics, paused_count=args.paused_count)
+    if args.json:
+        print(json.dumps({**metrics, "paused_count": args.paused_count, "action": action},
+                         separators=(",", ":")))
+    else:
+        emit("memory-action", "ok", action=action, paused_count=args.paused_count, **metrics)
+
+
 def read_log_tail(path: pathlib.Path, limit: int) -> str:
     """Read only a bounded tail before redaction; never load an unbounded worker log."""
     byte_limit = max(limit * 4, 4096)

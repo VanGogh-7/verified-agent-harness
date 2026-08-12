@@ -28,7 +28,7 @@ def load_harness() -> dict[str, object]:
         "__name__": "verified_agent_harness_under_test",
         "__file__": str(SCRIPTS / "harness"),
     }
-    for name in ("harness_core.py", "harness_commands.py"):
+    for name in ("harness_core.py", "harness_parallel.py", "harness_commands.py"):
         path = SCRIPTS / name
         exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace, namespace)
     return namespace
@@ -277,7 +277,7 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn("detect_lifecycle", H)
         router_path = SKILL_ROOT.parent / "bin/harness"
         if router_path.is_file():
-            # The top-level router is part of the source repository, not the installed Skill payload.
+            # Source-repository router, not installed Skill payload.
             router = router_path.read_text(encoding="utf-8")
             self.assertIn("detect|assess|bootstrap|adopt|activate|rollback-gc", router)
             self.assertIn('SCRIPT="$LIFECYCLE_SCRIPT"', router)

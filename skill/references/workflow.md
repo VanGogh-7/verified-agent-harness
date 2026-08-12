@@ -40,11 +40,11 @@ harness run-advisory --role researcher --dry-run
 
 ## FAST, DAG, and LONG_RUNNING
 
-FAST uses one writer plus direct deterministic verification and should not initialize the Stage engine solely for trivial work. DAG uses isolated worktrees and optional durable tasks for genuinely independent writers. LONG_RUNNING uses durable tasks, event-driven waiting, and explicit completion contracts. In DAG and LONG_RUNNING, every candidate still passes the verified inner Harness before integration. Outer task metadata is coordination state, never the trusted approval boundary.
+FAST uses one writer plus direct deterministic verification and should not initialize the Stage engine solely for trivial work. DAG uses the validated contract in `parallel-workflow.md`: the Orchestrator decides whether decomposition is safe, freezes shared contracts, assigns disjoint write scopes to isolated worktrees, runs ready tasks in resource-safe waves, and validates the complete integration candidate through the inner Harness. LONG_RUNNING uses durable tasks, event-driven waiting, and explicit completion contracts. Outer task metadata is coordination state, never the trusted approval boundary.
 
 ## Evidence and resource rules
 
-Before every heavy action, run `harness status --json` and perform the host resource preflight. Never overlap heavy processes. Worker environments are minimal and gates use a temporary HOME; neither is a hostile-repository sandbox. Do not read `.env` files. Runtime reports are mirrors; approval uses `.git/harness-control/` and recomputes `candidate_id`.
+Before every heavy action, run `harness status --json` and perform the host resource preflight. Never overlap heavy processes. During an approved parallel wave, the outer Orchestrator must additionally run the continuous memory guard from `parallel-workflow.md` and selectively pause or resume contained workers under hysteretic backpressure. Worker environments are minimal and gates use a temporary HOME; neither is a hostile-repository sandbox. Do not read `.env` files. Runtime reports are mirrors; approval uses `.git/harness-control/` and recomputes `candidate_id`.
 
 Dry-run all Stage and advisory roles without business mutation:
 
