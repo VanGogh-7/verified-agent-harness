@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex Runtime Harness"
+  short_description: "Bounded Codex CLI process control and evidence"
+  default_prompt: "Use $codex-harness only for bounded Codex CLI runtime control; route engineering method to installed Addy Skills and repository harness design to harness-creator."
+policy:
+  allow_implicit_invocation: true

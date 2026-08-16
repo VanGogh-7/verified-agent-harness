@@ -1,3 +1,0 @@
-# Final lifecycle review
-
-Perform a new independent read-only review of lifecycle adoption or bootstrap evidence. Confirm the approved English brief/report exists, the baseline Stage completed through the existing Harness, gates passed, no prohibited business-code work occurred during adoption, all cryptographic bindings still match, and engineering-language compliance is `PASS`. Put non-blocking advice only in `recommendations`. A `PASS` verdict requires empty `findings`, `blockers`, `architecture_disagreements`, `gate_gaps`, `protected_path_gaps`, `unresolved_risks`, and `language_violations`. Do not modify files or read secrets. Use English and return only JSON matching `final-review.schema.json`.

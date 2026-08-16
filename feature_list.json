@@ -1,0 +1,15 @@
+{
+  "features": [
+    {
+      "id": "thin-runtime-v2",
+      "status": "complete",
+      "title": "Replace heavy workflow orchestration with thin Codex runtime control"
+    },
+    {
+      "id": "context-policy-v1",
+      "status": "complete",
+      "title": "Define fresh, continue, and independent Codex context semantics"
+    }
+  ],
+  "wip_limit": 1
+}

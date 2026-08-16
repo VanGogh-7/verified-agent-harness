@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Install the thin Codex runtime Skill using non-destructive symlinks."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def parser() -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser(description="Install the thin Codex runtime Harness")
+    value.add_argument("--skills-dir", type=Path, default=Path.home() / ".agents" / "skills")
+    value.add_argument("--bin-dir", type=Path, default=Path.home() / ".local" / "bin")
+    value.add_argument("--dry-run", action="store_true")
+    return value
+
+
+def same_link(target: Path, source: Path) -> bool:
+    return target.is_symlink() and target.resolve(strict=False) == source.resolve(strict=True)
+
+
+def main() -> int:
+    args = parser().parse_args()
+    links = [
+        (ROOT / "skill", args.skills_dir / "codex-harness"),
+        (ROOT / "lifecycle-skill", args.skills_dir / "project-lifecycle-harness"),
+        (ROOT / "bin/codex-harness", args.bin_dir / "codex-harness"),
+    ]
+    operations: list[dict[str, str]] = []
+    for source, target in links:
+        if not source.exists() or source.is_symlink():
+            raise SystemExit(f"install refused: invalid source {source}")
+        if os.path.lexists(target):
+            action = "PRESERVE" if same_link(target, source) else "REFUSE"
+        else:
+            action = "CREATE"
+        operations.append({"action": action, "source": str(source), "target": str(target)})
+    if any(item["action"] == "REFUSE" for item in operations):
+        print(json.dumps({"status": "refused", "operations": operations}, sort_keys=True))
+        return 2
+    if args.dry_run:
+        print(json.dumps({"status": "dry-run", "operations": operations}, sort_keys=True))
+        return 0
+    created: list[Path] = []
+    try:
+        for (source, target), operation in zip(links, operations, strict=True):
+            if operation["action"] == "PRESERVE":
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(source, target_is_directory=source.is_dir())
+            created.append(target)
+    except Exception:
+        for target in reversed(created):
+            if target.is_symlink():
+                target.unlink()
+        raise
+    print(json.dumps({"status": "installed", "operations": operations}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

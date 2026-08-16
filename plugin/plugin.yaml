@@ -1,7 +1,0 @@
-name: verified-agent-harness-context
-version: "1.0.0"
-description: "Context occupancy and safe compaction fallback tools for agent-harness orchestration."
-author: "Hermes Agent"
-provides_tools:
-  - harness_context_status
-  - harness_compact_if_needed

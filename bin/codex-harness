@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+SELF_PATH=$(readlink -f "$0")
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
+SOURCE_ROOT=$(CDPATH= cd -- "$SELF_DIR/.." && pwd -P)
+
+if [ -f "$SOURCE_ROOT/skill/scripts/codex_runtime.py" ]; then
+  RUNTIME="$SOURCE_ROOT/skill/scripts/codex_runtime.py"
+elif [ -f "$SELF_DIR/../skills/codex-harness/scripts/codex_runtime.py" ]; then
+  RUNTIME="$SELF_DIR/../skills/codex-harness/scripts/codex_runtime.py"
+elif [ -n "${CODEX_HARNESS_SKILLS_DIR:-}" ] && [ -f "$CODEX_HARNESS_SKILLS_DIR/codex-harness/scripts/codex_runtime.py" ]; then
+  RUNTIME="$CODEX_HARNESS_SKILLS_DIR/codex-harness/scripts/codex_runtime.py"
+else
+  printf '%s\n' "codex-harness: cannot locate codex_runtime.py" >&2
+  exit 127
+fi
+
+exec python3 "$RUNTIME" "$@"

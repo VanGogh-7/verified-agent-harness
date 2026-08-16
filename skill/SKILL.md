@@ -1,110 +1,89 @@
 ---
-name: agent-harness
-description: Classify and execute trusted-local, evidence-bound engineering workflows through a provider-neutral agent adapter.
-version: 1.0.0
-author: agent-harness contributors
-license: MIT
-platforms: [linux]
+name: codex-harness
+description: Run or resume a bounded Codex CLI process with WIP=1, timeout handling, and inspectable local runtime evidence. Use only when a task needs Codex-specific process control; do not use it as a planning, testing, review, approval, Git, or project-lifecycle methodology.
 ---
 
-# agent-harness 1.0
+# Codex runtime harness
 
-## Purpose
+This Skill is intentionally thin. It controls Codex at runtime; it does not define how to engineer software.
 
-Act as the Orchestrator for a trusted-local engineering workflow. The inner Harness enforces:
+## Route first
 
-```text
-one writer -> deterministic gates -> independent read-only assessors -> independent verifier -> approval
+Select only the installed Addy Skills relevant to the task; do not preload the full catalog. For example:
+
+- bug fix → `debugging-and-error-recovery` and `test-driven-development`
+- feature → `planning-and-task-breakdown`, `incremental-implementation`, and `test-driven-development`
+- security review → `security-and-hardening`
+- final cleanup → `code-review-and-quality` and `code-simplification`
+- Git operations → `git-workflow-and-versioning`
+- context or uncertainty → `context-engineering` or bounded `doubt-driven-development`
+
+Use `harness-creator` for repository instructions, scope, human-readable task/progress state, executable verification, handoff, and lifecycle. Follow the repository's `AGENTS.md` and verification entrypoint.
+
+Only use this Skill when Codex CLI process control itself is needed.
+
+## Context policy
+
+Treat a Codex thread as ephemeral, task-local working memory. Use one thread for one bounded task and choose deliberately:
+
+- **CONTINUE** — resume the exact thread only for the same objective and implementation or debugging chain. Interrupted work, investigating a test failure, applying its task-local fix, and rerunning verification are continuations.
+- **FRESH** — use `run` for a new bounded task, feature, slice, unrelated bug, or materially changed objective. Also prefer fresh context after task completion, when obsolete attempts dominate the thread, or once repository artifacts are the authoritative handoff. Context pressure may justify a fresh start, but no arbitrary token threshold decides it.
+- **INDEPENDENT** — always use a fresh `run` when value depends on independent judgment. Never resume the implementation thread for independent code or correctness review, security review, architecture challenge, release approval, or doubt-driven review.
+
+The boundaries `implementation → independent review`, `implementation → security review`, `implementation → architecture challenge`, `implementation → release approval`, and `task A → unrelated task B` require fresh context. `implementation → test failure → debug → fix → rerun` remains CONTINUE.
+
+Persistent project memory belongs in `AGENTS.md`, code, tests, Git history, repository progress/state artifacts, exec plans, handoffs, and verification evidence—not conversation history. If deleting the thread would lose essential project state, improve the repository harness with `harness-creator`; do not turn this runtime wrapper into a state manager.
+
+Single-agent execution is the default: one bounded task, one working thread. When independence is justified, use one bounded fresh-context review that returns findings to the main task or an explicit repair task. Do not create a permanent role pipeline or automatic review loop.
+
+## Runtime contract
+
+`scripts/codex_runtime.py` provides:
+
+- one active run per workspace (WIP=1);
+- explicit `read-only` or `workspace-write` sandbox selection;
+- hard wall-clock timeout and process-group termination;
+- JSONL events, stderr, final response, thread ID, token usage, and result metadata;
+- exact-session resume by saved thread ID;
+- recovery of abandoned `running` records as `interrupted`.
+
+It has five process states: `running`, `succeeded`, `failed`, `timed_out`, and `interrupted`. These are runtime facts, not task approval states.
+
+Run evidence is stored under `<workspace>/.codex-harness/runs/<run-id>/`. Add `.codex-harness/` to the target repository's ignore rules when evidence should remain local.
+
+## Commands
+
+Pass prompts by file so shell quoting cannot alter them:
+
+```bash
+python3 scripts/codex_runtime.py doctor
+python3 scripts/codex_runtime.py run \
+  --workspace /absolute/repo \
+  --prompt-file /absolute/prompt.md \
+  --sandbox workspace-write \
+  --timeout 1800
+python3 scripts/codex_runtime.py status --workspace /absolute/repo
+python3 scripts/codex_runtime.py resume \
+  --workspace /absolute/repo \
+  --run-id <run-id> \
+  --prompt-file /absolute/follow-up.md
 ```
 
-Git HEAD plus a credential-safe worktree fingerprint forms `candidate_id`. A new candidate invalidates every old gate, assessor, and Verifier report. Slice candidates may remain uncommitted; commits remain a Stage-level policy.
+Use `--schema` only when the caller actually needs structured final output. Use `--ephemeral` only when resume is intentionally unavailable. Model and reasoning effort are optional pass-through deployment choices.
 
-`run-advisory --role explorer|researcher|test_triage|log_triage` is an optional, non-authoritative read-only inspection path. Its bounded advice is not a Stage worker result, cannot satisfy an assessment or enter the Verifier join, and never changes approval or repair state.
+## Boundaries
 
-## Classify first
+- Do not create mandatory Implementer/Reviewer/Verifier roles.
+- Do not treat model prose as verification evidence.
+- Do not implement task state, approval, candidate fingerprints, gate policy, lifecycle, planning, TDD, review loops, Git policy, security methodology, or performance methodology here.
+- Run repository verification commands directly and record their executable results in the repository-owned progress artifact.
+- One independent review may be useful for a high-risk decision; it must be bounded and is not a default pipeline.
 
-- `FAST`: trivial, localized, low-risk work. Use one writer and direct deterministic checks; do not initialize the Stage engine solely for FAST work.
-- `VERIFIED`: default for nontrivial work. Use Implementer, gates, Correctness Reviewer, Tester, Verifier.
-- `SECURITY`: VERIFIED plus Security Reviewer. Select it with `start-stage --workflow SECURITY`; it cannot be toggled during an active Stage.
-- `DAG`: Hermes first validates a decomposition plan, freezes shared contracts, then directs genuinely independent writers in isolated worktrees. The complete integration candidate passes the inner verified gate once after integration.
-- `LONG_RUNNING`: use durable Kanban tasks, event-driven waiting, and explicit completion contracts around the same inner gate.
+Read `references/runtime-contract.md` only when changing the runner or its evidence format.
 
-Kanban is an optional outer durable DAG. Its flexible metadata is never a trusted approval boundary and does not replace `.git/harness-control/`.
+## Self-verification
 
-## Authority
-
-- Implementer is the only writer. It may edit only the approved worktree scope.
-- Gates execute configured deterministic commands without a shell.
-- Correctness Reviewer, Tester, optional Security Reviewer, and Verifier are policy read-only. The configured trusted adapter must enforce that access mode; the core independently rejects their evidence if the candidate changed, but does not provide kernel-level containment for an arbitrary adapter.
-- Assessor findings are hypotheses. Assessors cannot approve or force repair.
-- Explorer, Researcher, Test Triage, and Log Triage are optional non-authoritative advisers. They may inspect and return structured advice only; none may mutate source, become required assessment evidence, enter the Verifier join, approve, or force repair.
-- Verifier classifies each finding as `confirmed`, `rejected`, `inconclusive`, or `flaky_or_infra`.
-- Only confirmed policy-blocking findings cause `CHANGES_REQUIRED`. Policy-blocking inconclusive or `flaky_or_infra` evidence fails closed to `BLOCKED`; rejected findings do not cause repair.
-- The Orchestrator alone starts Stages, runs gates, accepts approval, changes policy between Stages, and owns external coordination.
-
-All roles deny secrets and network authority by default. No role may merge, commit, push, publish, tag, release, or alter protected control files unless a separately approved project policy grants the specific action. No outbound telemetry exists; concise local evidence counters are allowed.
-
-## Protocol
-
-1. Obtain explicit scope and acceptance approval. When lifecycle routing is required, use the repository-installed `bin/harness` router; this Stage Skill intentionally exposes no `detect`, `assess`, `bootstrap`, `adopt`, or `activate` command.
-2. `harness init`, then `harness start-stage --workflow VERIFIED|SECURITY ...`.
-3. Run Implementer. It records schema version, attempt, `base_sha`, final `candidate_id`, changed files, command results, decisions, limitations, residual risk, and blockers.
-4. Run deterministic gates. Slice or Stage gates bind their evidence to the same candidate.
-5. Run required assessors. Logical fan-out may execute serially whenever host resources do not safely allow concurrency.
-6. Run Verifier only after every required assessor report exists.
-7. Run `approve-slice` only after Verifier approval. Approval revalidates all canonical reports, candidate identity, protected baseline, Git HEAD, and current worktree.
-
-Use `harness run-advisory --role <role> [--dry-run]` only while no worker or gate holds the Harness lock. It produces a candidate-bound runtime record and non-authoritative structured advice; it does not add trusted evidence or alter the Stage state.
-
-Use the configured agent runtime adapter for real workers, bind any external session to the active generation, and treat notifications only as wakeups. Read canonical state again after every wakeup. Dry runs produce only runtime artifacts and never mutate business state or satisfy approval.
-
-## Candidate and evidence policy
-
-`harness candidate-id --json` returns the current identity. The identity is derived from `candidate-v1`, the Stage baseline `base_sha`, exact Git status, and exact changed worktree content. Candidate capture requires two consecutive matching worktree fingerprints and fails closed after bounded retries if the tree is changing. Because index status participates in the identity, finalize staging before gates and assessors; staging or unstaging afterward requires fresh candidate-bound evidence. Credential-shaped files contribute metadata only; their contents are never read. All role reports repeat attempt, base, and candidate. Mismatch fails closed for assessors, Verifier, and approval.
-
-Canonical state and validated evidence live under `.git/harness-control/`. Project-facing `.harness/state.json` and runtime reports are mirrors. The protected baseline binds Git HEAD, stable Git configuration, and configured protected files. State uses atomic replace, fsync, a lock, and revision checks.
-
-Retain source-system JSON or raw logs for external claims, plus revision identity and integrity evidence. Plan prose is not evidence. No hosted CI, app-server, A2A, MCP, publication provider, or distributed scheduler is implemented by this Skill.
-
-Advisory output is deliberately non-authoritative runtime material, even when `run-advisory` binds it to the current Stage base and candidate. It is not copied into `.git/harness-control/`, cannot satisfy required assessments, and cannot change the evidence DAG.
-
-## Repair and resource policy
-
-The default budget is the initial candidate plus two repair rounds (`max_slice_attempts = 3`). Only a positively classified adapter spawn/exec or structured-output startup rejection before business work, with an unchanged worktree, releases a tentative Implementer attempt. Classification fails closed: timeouts, ordinary nonzero exits, worktree changes, invalid or missing handoffs, and runtime-integrity failures remain charged. A confirmed blocker consumes the next Implementer round; exhaustion enters `HUMAN_CHECKPOINT`.
-
-Never overlap a live Worker or Reviewer with another heavy process; the same rule covers Tester, Security Reviewer, Verifier, advisory execution, builds, tests, benchmarks, and packaging. Check RAM, swap trend, GPU headroom when relevant, and live agent descendants before launch. `CARGO_BUILD_JOBS=4` is the default cap. Logical assessor fan-out may be serial.
-
-For DAG execution, keep a continuous memory guard active for the entire parallel wave. Sample `MemAvailable`, swap headroom, and Linux PSI; selectively pause heavy workers first and resume one only after three recovered samples. Bind every worker to canonical run/task/generation state and complete verified cgroup containment—never trust an arbitrary workers file or signal only a launcher PID. With no active worker, close admission and fall back to serial. An active uncontained worker fails closed to `BLOCKED_UNCONTAINED` until drained.
-
-The Skill provides validation and policy primitives, not an in-process distributed scheduler. Hermes owns outer fan-out and may use writable parallel lanes only when their execution facility exposes complete containment, committed-base identity, and verifiable freeze/thaw. Unpausable delegated children are restricted to bounded read-only analysis; memory pressure causes admission to close and writable work to remain or become serial.
-
-Worker generation, Stage, Slice, attempt, candidate, owner/worker identities, session, and checkpoint epoch are recovery bindings. Stale evidence is rejected for every role. See `references/recovery.md`.
-
-## Compatibility and migration
-
-Version 1.0.0 does not mutate an active 0.4.0 Stage. Existing active Stages fail closed and must finish with the installed 0.4.0 Skill or be explicitly abandoned by the operator. Migrate only between Stages: back up control artifacts, install 1.0.0, review and merge the new config keys, run `harness doctor`, review state/config together, and start the next Stage so the new baseline is captured. User files and existing Git history are preserved. `config_version` remains 1; unknown versions fail closed.
-
-Mandatory model names from the research report are not adopted because product labels and availability drift. Optional per-role model routing accepts deployment aliases in `[agent_runtime.models]`, and optional validated effort routing accepts `none`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` in `[agent_runtime.reasoning_efforts]`; omission leaves provider policy to the selected adapter. For complex writable work, deployments may explicitly route the Implementer at `ultra` while keeping independent read-only roles at separately chosen efforts; the bundled Group policy does so and documents the exact routing in the repository README and adapter README. Legacy provider-specific configuration is rejected during active work and may be migrated explicitly only between Stages. Commit-per-Slice is not adopted because exact candidate identity provides revision binding while preserving Stage-level commit policy.
-
-## Read on demand
-
-- Command order and Kanban boundary: `references/workflow.md`
-- Hermes-led decomposition, shared contracts, memory guard, and integration: `references/parallel-workflow.md`
-- Executable states and transitions: `references/state-machine.md`
-- Recovery and invalidation: `references/recovery.md`
-- Control/source/evidence/reasoning layers: `references/architecture.md`
-- Agent handoff contracts: `references/contracts/*.schema.json`
-- Executable runtime contract: `references/adapter-contract.md`
-- Gate contract: `schemas/quality-gates.schema.json`
-
-## Verification
-
-Run:
-
-```text
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_harness.py
-scripts/harness --version
-scripts/harness doctor
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v scripts.test_runtime
+python3 /home/van-gogh/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
 ```
-
-For workflow changes, exercise `init`, `start-stage`, every Stage worker, and `run-advisory --dry-run` in a disposable committed repository. No `__pycache__` may remain.
